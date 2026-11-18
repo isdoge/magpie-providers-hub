@@ -441,3 +441,45 @@ test('headlessCarrierNote：Linux 无 DISPLAY 且未覆盖 → 提示配置覆�
   // 显式声明（测试/其它平台）→ 提示
   assert.match(headlessCarrierNote({ overridden: false }, { MAGPIE_HUB_HEADLESS: '1' }, 'win32'), /oauthCallbackHost/)
 })
+
+// ── 无界面零配置自动覆盖（2026-11-18 用户定案：最通用，不假设 tailscale）──
+
+const { pickExternalIPv4, isLikelyHeadless } = await import('../src/shared.mjs')
+
+test('oauthRedirect 自动覆盖：无界面 + 有对外网卡 → 自动用该 IP、绑 0.0.0.0、auto 标记', () => {
+  const interfaces = {
+    lo: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }],
+    docker0: [{ family: 'IPv4', internal: false, address: '172.17.0.1' }],
+    eth0: [{ family: 'IPv4', internal: false, address: '192.168.1.50' }],
+  }
+  const r = oauthRedirect({}, { env: { MAGPIE_HUB_HEADLESS: '1' }, platform: 'win32', interfaces })
+  assert.equal(r.host, '192.168.1.50', '跳过 docker 虚拟网卡，挑真实网卡')
+  assert.equal(r.bindHost, '0.0.0.0')
+  assert.equal(r.overridden, true)
+  assert.equal(r.auto, true)
+  // 显式选项永远优先
+  const explicit = oauthRedirect({ oauthCallbackHost: '10.0.0.9' }, { env: { MAGPIE_HUB_HEADLESS: '1' }, platform: 'win32', interfaces })
+  assert.equal(explicit.host, '10.0.0.9')
+  assert.equal(explicit.auto, undefined)
+  // 非无界面 → 桌面零变化
+  const desktop = oauthRedirect({}, { env: {}, platform: 'win32', interfaces })
+  assert.equal(desktop.overridden, false)
+  assert.equal(desktop.host, '127.0.0.1')
+  // 无界面但无对外地址 → 回环 + 不标记
+  const none = oauthRedirect({}, { env: { MAGPIE_HUB_HEADLESS: '1' }, platform: 'win32', interfaces: { lo: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }] } })
+  assert.equal(none.overridden, false)
+})
+
+test('pickExternalIPv4：虚拟网卡全跳过时退任取非内部；VPN tun 保留', () => {
+  assert.equal(pickExternalIPv4({ docker0: [{ family: 'IPv4', internal: false, address: '172.17.0.1' }] }), '172.17.0.1')
+  assert.equal(pickExternalIPv4({ tun0: [{ family: 'IPv4', internal: false, address: '100.64.0.7' }], eth0: [{ family: 'IPv4', internal: false, address: '192.168.1.50' }] }), '100.64.0.7', 'tun 不算虚拟网卡，优先序按对象序')
+  assert.equal(pickExternalIPv4({}), '')
+  assert.equal(isLikelyHeadless({ DISPLAY: '' }, 'linux'), true)
+  assert.equal(isLikelyHeadless({ DISPLAY: ':0' }, 'linux'), false)
+})
+
+test('headlessCarrierNote：auto 覆盖 → 公网安全口径提示；显式覆盖/桌面零噪音', () => {
+  assert.match(headlessCarrierNote({ overridden: true, auto: true }, {}, 'win32'), /公网/)
+  assert.match(headlessCarrierNote({ overridden: true, auto: true }, {}, 'win32'), /oauthCallbackHost/)
+  assert.equal(headlessCarrierNote({ overridden: true }, {}, 'win32'), '')
+})

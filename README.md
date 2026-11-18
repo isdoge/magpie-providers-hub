@@ -275,7 +275,15 @@ magpie plugin on  "<目录>"
 
 magpie 跑在**无头服务器**上、浏览器在你自己机器上时，OAuth 回调写死
 `127.0.0.1` 永远到不了服务器（[#3](https://github.com/Gyl1219/magpie-providers-hub/issues/3)）。
-两个插件选项解决它，**不填则桌面行为一格不变**：
+
+**无界面零配置（2026-11-18 定案）**：检测到无界面（Linux 无 DISPLAY/WAYLAND_DISPLAY，
+或 `MAGPIE_HUB_HEADLESS=1`）且未显式配置时，自动挑一个对外网卡 IPv4（跳过
+docker/veth/网桥等虚拟网卡，VPN tun/tap 保留）作为登录页/回调地址，绑 `0.0.0.0`——
+载体页在自己浏览器直接可开、登录完自动完成，无需任何配置。桌面环境一个字节不变。
+⚠️ 自动覆盖意味着登录页对**所有网卡**可达：机器有公网 IP 时对公网可达（登录页只接受
+登录提交、不泄露已存凭据）；要收口就显式设置 `oauthCallbackHost`（如内网 IP）。
+
+显式选项（永远优先于自动覆盖）：
 
 ```bash
 magpie plugin options hub-lobsterai '{"oauthCallbackHost":"100.64.0.1","oauthCallbackPort":8765}'

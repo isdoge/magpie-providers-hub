@@ -4,7 +4,7 @@
 //    插件不碰 magpie 的配置目录，账号只存 magpie 账号槽。
 
 import { readFileSync, appendFileSync, mkdirSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { homedir, tmpdir, networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 
 /**
@@ -140,21 +140,51 @@ const FETCH_BAD_PORTS = new Set([
 export const isFetchBadPort = (port) => FETCH_BAD_PORTS.has(Number(port))
 
 /**
- * 无界面环境的载体页提示（2026-11-18 真机报障：Linux magpie 被桌面访问时，
- * 点登录给 127.0.0.1 打不开，对话框却毫无解释）。仅在「疑似无界面 **且**
- * 未配置覆盖」时出文案；桌面零噪音。判定：Linux 无 DISPLAY/WAYLAND_DISPLAY，
- * 或 MAGPIE_HUB_HEADLESS=1 显式声明（测试/其它平台用）。
- * ⚠️ 只提示、**不自动覆盖**：载体页没有 state/PKCE 兜底，默认暴露网卡是
- *    安全回归（issue #3 定案口径：覆盖必须显式 opt-in，仅限可信网络）。
+ * 无界面判定：Linux 无 DISPLAY/WAYLAND_DISPLAY，或 MAGPIE_HUB_HEADLESS=1
+ * 显式声明（测试/其它平台用）。oauthRedirect 自动覆盖与载体页提示共用。
+ */
+export const isLikelyHeadless = (env = process.env, platform = process.platform) =>
+  env.MAGPIE_HUB_HEADLESS === '1' || (platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY)
+
+/**
+ * 挑一个对外可达的 IPv4（无界面零配置用）。跳过回环与 docker/veth/网桥等
+ * 虚拟网卡（它们对外不可达）；VPN 的 tun/tap 保留（往往正是可达地址）。
+ * 首选真实网卡，全被跳过时退而求其次任取非内部 IPv4；都没有返回 ''。
+ */
+export function pickExternalIPv4(interfaces = networkInterfaces()) {
+  const entries = Object.entries(interfaces ?? {})
+  const ipv4 = (list) => (list ?? []).find((a) => (a.family === 'IPv4' || a.family === 4) && !a.internal)
+  const virtual = /^(lo|docker|veth|br-|virbr|vbox|vmnet)/i
+  for (const [name, list] of entries) {
+    if (virtual.test(name)) continue
+    const hit = ipv4(list)
+    if (hit) return hit.address
+  }
+  for (const [, list] of entries) {
+    const hit = ipv4(list)
+    if (hit) return hit.address
+  }
+  return ''
+}
+
+/**
+ * 无界面环境的载体页提示（2026-11-18 真机报障配套）。
+ * - auto 覆盖生效 → 安全口径提示（绑了全网卡，公网 IP 机器须知）；
+ * - 无界面但没挑到对外地址 → 提示显式配置 oauthCallbackHost；
+ * - 桌面 / 显式覆盖 → 零噪音。
+ * ⚠️ 自动覆盖只发生在无界面环境（用户定案）；桌面默认仍只绑回环。
  */
 export const headlessCarrierNote = (redirect, env = process.env, platform = process.platform) => {
+  if (redirect?.auto) {
+    return ' 注意：无界面环境已自动改用对外地址并绑定所有网卡（零配置）。若本机有公网 IP，'
+      + '登录页对公网可达——它只接受登录提交、不泄露已存凭据；如需收口，显式设置 '
+      + 'oauthCallbackHost（如内网 IP）后重新登录。'
+  }
   if (redirect?.overridden) return ''
-  const headless = env.MAGPIE_HUB_HEADLESS === '1'
-    || (platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY)
-  if (!headless) return ''
-  return ' 注意：检测到无界面环境。此地址默认只绑服务器回环，你自己的浏览器打不开是正常的——'
+  if (!isLikelyHeadless(env, platform)) return ''
+  return ' 注意：检测到无界面环境且未挑到对外网卡地址。此地址只绑服务器回环，你自己的浏览器打不开是正常的——'
     + '设置插件选项 oauthCallbackHost（本机对外可达 IP）/ oauthCallbackPort 后重新登录，'
-    + '地址会换成可达 host（见 README「Headless / 远程登录」）；仅限可信网络启用。'
+    + '地址会换成可达 host（见 README「Headless / 远程登录」）。'
 }
 
 /**
@@ -211,12 +241,19 @@ export async function listenCallbackPort(server, redirect, { unref = false, atte
  * ⚠️ 安全口径：覆盖后载体页/回调口对绑定网卡可达 —— OAuth 渠道仍有
  *    state/PKCE 回验兜底；载体页渠道请只在可信网络（如 tailscale）里启用。
  */
-export function oauthRedirect(options = {}) {
+export function oauthRedirect(options = {}, { env = process.env, platform = process.platform, interfaces } = {}) {
   const rawHost = options?.oauthCallbackHost
   const rawPort = options?.oauthCallbackPort
   const hasHost = typeof rawHost === 'string' && rawHost.trim() !== ''
   const hasPort = rawPort !== undefined && rawPort !== null && String(rawPort).trim() !== ''
   if (!hasHost && !hasPort) {
+    // 无界面零配置（2026-11-18 用户定案：最通用，不假设 tailscale）：
+    // 自动挑对外网卡地址、绑 0.0.0.0，载体页/中转页在自己浏览器直接可开。
+    // 桌面（非无界面）一个字节不变；显式选项永远优先（见下）。
+    if (isLikelyHeadless(env, platform)) {
+      const ip = pickExternalIPv4(interfaces ?? networkInterfaces())
+      if (ip) return { host: ip, urlHost: ip, port: 0, bindHost: '0.0.0.0', overridden: true, auto: true }
+    }
     return { host: OAUTH_CALLBACK_DEFAULT_HOST, urlHost: OAUTH_CALLBACK_DEFAULT_HOST, port: 0, bindHost: OAUTH_CALLBACK_DEFAULT_HOST, overridden: false }
   }
 
