@@ -39,7 +39,7 @@
 
 import { createServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
-import { assignExpiryBands, debugLog, notSignedIn } from './shared.mjs'
+import { assignExpiryBands, debugLog, notSignedIn, oauthRedirect, listenCallbackPort } from './shared.mjs'
 
 const PROVIDER = 'astudio'
 const DISPLAY = 'AStudio（讯飞）'
@@ -502,7 +502,10 @@ document.getElementById('refreshQr').addEventListener('click', loadQr);
 }
 
 /** 起本地 Carrier 服务，返回 loginUrl + result promise（对齐 DSH 的 startAstudioLoginFlow）。 */
-async function startLoginFlow() {
+async function startLoginFlow(options = {}) {
+  // 载体页地址收口（issue #3）：默认 127.0.0.1；options 覆盖后绑 0.0.0.0，
+  // 远程浏览器经对外可达 host 打开载体页（页面内请求全是相对路径，天然跟着 host 走）。
+  const redirect = oauthRedirect(options)
   let settleOk, settleFail
   const result = new Promise((resolve, reject) => { settleOk = resolve; settleFail = reject })
   /** 载体页流程状态（微信 Tab 当前二维码的 fd）。 */
@@ -738,15 +741,9 @@ async function startLoginFlow() {
     }
   })
 
-  const port = await new Promise((resolve, reject) => {
-    server.listen(0, '127.0.0.1', () => {
-      const addr = server.address()
-      typeof addr === 'object' && addr !== null ? resolve(addr.port) : reject(new Error('无法获取端口'))
-    })
-    server.on('error', reject)
-  })
+  const port = await listenCallbackPort(server, redirect)
 
-  return { loginUrl: `http://127.0.0.1:${port}/login`, result: result.finally(() => { clearTimeout(timer) }), close: closeServer }
+  return { loginUrl: `http://${redirect.urlHost}:${port}/login`, result: result.finally(() => { clearTimeout(timer) }), close: closeServer }
 }
 
 /** 拉目录：`GET {maas}/api/v1/model-manager/models`。 */
@@ -815,8 +812,8 @@ export const astudioChannel = {
    * ⚠️ 不在 authorize 里等登录：magpie 先拿 url 打开浏览器、再调 callback 等结果。
    *    url 已就绪（本地服务已在监听），登录在 `result` 上推进。
    */
-  async beginLogin(openBrowser) {
-    const flow = await startLoginFlow()
+  async beginLogin(openBrowser, opts = {}) {
+    const flow = await startLoginFlow(opts.options)
     if (openBrowser) openBrowser(flow.loginUrl)
     return { url: flow.loginUrl, result: flow.result }
   },

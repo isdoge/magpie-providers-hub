@@ -29,7 +29,7 @@ const UA =
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { assignExpiryBands, debugLog } from './shared.mjs'
+import { assignExpiryBands, debugLog, oauthRedirect, listenCallbackPort } from './shared.mjs'
 
 const REQUEST_TIMEOUT_MS = 30_000
 /** api_key 只活 2 小时，提前 10 分钟续。 */
@@ -574,7 +574,11 @@ $('go-jwt').addEventListener('click', async () => {
    *   ② 手机号 + 密码（调 API）
    *   ③ 粘贴 JWT + 组织码
    */
-  async function beginLogin(openBrowser) {
+  async function beginLogin(openBrowser, opts = {}) {
+    // 载体页地址收口（issue #3）：默认 127.0.0.1；options 覆盖后绑 0.0.0.0，
+    // 远程浏览器经对外可达 host 打开载体页（①浏览器登录仍在本机拉起 Chrome，
+    // headless 无浏览器时走 ②手机号密码 / ③粘贴 JWT 两条路）。
+    const redirect = oauthRedirect(opts.options)
     const { createServer } = await import('node:http')
     let settleOk, settleFail
     const result = new Promise((resolve, reject) => { settleOk = resolve; settleFail = reject })
@@ -703,9 +707,8 @@ $('go-jwt').addEventListener('click', async () => {
         sendJson(res, 200, { ok: false, message: error?.message ?? String(error) })
       }
     })
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-    const port = server.address().port
-    const url = `http://127.0.0.1:${port}/login`
+    const port = await listenCallbackPort(server, redirect)
+    const url = `http://${redirect.urlHost}:${port}/login`
     try { openBrowser?.(url) } catch { /* ignore */ }
     return { url, result }
   }

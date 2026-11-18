@@ -28,7 +28,7 @@
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
-import { fetchWithRetry } from './shared.mjs'
+import { fetchWithRetry, oauthRedirect, listenCallbackPort, renderCallbackRelayPage, parsePastedCallbackUrl } from './shared.mjs'
 
 export const CHANNEL_ID = 'accio'
 export const DISPLAY_NAME = 'Accio (阿里)'
@@ -237,6 +237,9 @@ export async function refreshCredential(current) {
  */
 async function beginLogin(openBrowser, opts = {}) {
   const region = opts.arg === 'global' ? 'global' : 'cn'
+  // 回调地址收口（issue #3）：默认 127.0.0.1（只绑回环）；options 覆盖后
+  // 绑 0.0.0.0、redirect_uri 用对外可达 host。state/PKCE 回验不变。
+  const redirect = oauthRedirect(opts.options)
   const pkce = createPkce()
   const state = randomBytes(32).toString('hex')
   let settleOk, settleFail
@@ -246,11 +249,50 @@ async function beginLogin(openBrowser, opts = {}) {
   let timer
   let serverClosed = false
 
-  const server = createServer((request, response) => {
+  // 覆盖模式的中转页要引用厂商登录链接（listen 拿到端口后才拼得出来）
+  let vendorLoginUrl = ''
+  const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', `http://127.0.0.1:${request.socket.localPort ?? 0}`)
     const page = (title, message) => '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
       + `<title>${title}</title></head>`
       + `<body style="font-family:system-ui;padding:2rem"><p>${message}</p></body></html>`
+    const sendJson = (status, data) => {
+      response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+      response.end(JSON.stringify(data))
+    }
+    // ── 粘贴中转（issue #3，**仅覆盖模式**；默认模式一个字节都不加）─────
+    // 浏览器与 magpie 不在同一台机时，回调可能落在用户机器的回环上 ——
+    // 地址栏里仍留着完整回调 URL（code+state），粘贴回来即可在服务端完成
+    // PKCE 交换（交换是纯服务端 API，不依赖回调落在哪台机器）。
+    if (redirect.overridden && (url.pathname === '/' || url.pathname === '/relay')) {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+      response.end(renderCallbackRelayPage({ displayName: DISPLAY_NAME, loginUrl: vendorLoginUrl }))
+      return
+    }
+    if (redirect.overridden && url.pathname === '/paste-callback' && request.method === 'POST') {
+      if (settled) return sendJson(200, { ok: true, message: '登录已完成，可以关闭此页面' })
+      const body = await new Response(request).json().catch(() => ({}))
+      try {
+        const pasted = parsePastedCallbackUrl(body?.url, CALLBACK_PATH)
+        // ⚠️ 粘贴路的 state 校验**不终结会话**：贴错了还能再贴（与自动路不同）
+        if ((pasted.searchParams.get('state') ?? '') !== state) {
+          return sendJson(200, { ok: false, message: 'state 不匹配 —— 请确认复制的是本次登录跳转出的完整地址' })
+        }
+        const errorCode = pasted.searchParams.get('error')
+        if (errorCode !== null && errorCode !== '') {
+          return sendJson(200, { ok: false, message: `授权被拒绝（${errorCode}）—— 请重新走一遍登录` })
+        }
+        const code = pasted.searchParams.get('code') ?? ''
+        if (code === '') return sendJson(200, { ok: false, message: '回调地址里没有授权码' })
+        const credential = await exchangeCode({ code, codeVerifier: pkce.verifier, redirectUri, region })
+        sendJson(200, { ok: true, message: '登录成功，可以关闭此页面' })
+        settle(true, credential)
+      } catch (error) {
+        // 交换失败不 settle：code 可能已消费 —— 提示用户重走登录链接拿新 code
+        sendJson(200, { ok: false, message: `${error instanceof Error ? error.message : String(error)}（若授权码已失效，请重新打开页面上的登录链接再试）` })
+      }
+      return
+    }
     if (url.pathname !== CALLBACK_PATH) {
       response.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' }).end(page('Accio 授权', '未知的回调路径'))
       return
@@ -309,36 +351,33 @@ async function beginLogin(openBrowser, opts = {}) {
   timer = setTimeout(() => fail(new Error('accio: 登录超时（未收到授权回调）')), LOGIN_TIMEOUT_MS)
   timer.unref?.()
 
-  // ⚠️ 先挂 'error' 再 listen（EADDRINUSE 是异步 error 事件，不挂会崩进程）。
-  // 这一段**只等端口绑定**（毫秒级），不等用户登录 —— 契约禁的是后者。
-  const port = await new Promise((resolve, reject) => {
-    let settledListen = false
-    server.once('error', (error) => {
-      if (settledListen) return
-      settledListen = true
-      reject(error)
-    })
-    // 只绑回环：绑全网卡会让同局域网机器也能投伪造的 ?code=。
-    server.listen(0, '127.0.0.1', () => {
-      settledListen = true
-      server.on('error', () => {})
-      const addr = server.address()
-      resolve(typeof addr === 'object' && addr !== null ? addr.port : 0)
-    })
-  }).catch((error) => {
+  // ⚠️ 先挂 'error' 再 listen、随机抽中 fetch 禁用端口要重抽 —— 统一走
+  //    listenCallbackPort（issue #3）。这一段**只等端口绑定**（毫秒级），
+  //    不等用户登录 —— 契约禁的是后者。
+  const port = await listenCallbackPort(server, redirect).catch((error) => {
     fail(new Error(`accio: 回调端口无法监听（${error.message}）`))
     throw error
   })
 
-  const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`
+  const redirectUri = `http://${redirect.urlHost}:${port}${CALLBACK_PATH}`
   const loginUrl = buildAuthUrl({ region, redirectUri, state, codeChallenge: pkce.challenge })
-  if (openBrowser) openBrowser(loginUrl)
+  vendorLoginUrl = loginUrl
+  // 覆盖模式：登录入口换成中转页（登录链接 + 粘贴框）；自动回调路照常并行可用。
+  // 默认模式：入口仍是厂商授权链接，行为一格不变。
+  const entryUrl = redirect.overridden ? `http://${redirect.urlHost}:${port}/relay` : loginUrl
+  if (openBrowser) openBrowser(entryUrl)
+  const regionLabel = region === 'global' ? '国际版' : '中国版'
+  // 地址不写进 instructions：宿主对话框本就把 url 渲染在可编辑框里，再嵌一遍是重复信息。
+  const instructions = redirect.overridden
+    ? `回调地址已覆盖为 ${redirect.urlHost}:${port}。请在你自己的浏览器里打开中转页（地址见下方输入框），` +
+      `按页面上的登录链接完成 Accio（阿里）${regionLabel}登录；若回调落在你自己的机器上（页面打不开），` +
+      '把地址栏完整地址粘贴回中转页即可。回调能直达本机时也会自动完成，无需粘贴。'
+    : `在打开的页面里完成 Accio（阿里）${regionLabel}登录，完成后本窗口自动继续。`
   return {
-    url: loginUrl,
+    url: entryUrl,
     result,
     cancel,
-    instructions: `在打开的页面里完成 Accio（阿里）${region === 'global' ? '国际版' : '中国版'}登录，`
-      + `完成后本窗口自动继续。也可以手动打开：${loginUrl}`,
+    instructions,
   }
 }
 

@@ -108,6 +108,215 @@ export function readMagpieAuthSlots(providerId) {
   })
 }
 
+// ── OAuth 回调 / 登录载体地址收口（issue #3）─────────────────────────────
+//
+// 背景：headless Linux 服务器上跑 magpie 时，登录浏览器在**另一台机器**上，
+// 回调写死 127.0.0.1 就永远等不到（回调落在用户那台机器的回环上）。
+// 收口方式：所有渠道的「回调 host/port」都从本函数取 ——
+//   · 默认仍是 127.0.0.1 + 随机端口（桌面端行为一格不变）；
+//   · 该供应商的 options（magpie plugins.json 里那一条的 options）填了
+//     oauthCallbackHost / oauthCallbackPort 时用用户的值。
+// ⚠️ 渠道文件里**不要**再各自写死回调 host/port，一律走这里。
+
+/** 回调默认 host（桌面端语义：只绑回环，局域网投不进伪造回调）。 */
+export const OAUTH_CALLBACK_DEFAULT_HOST = '127.0.0.1'
+
+/**
+ * fetch 规范的「坏端口」清单 —— 浏览器与 Node fetch(undici) 都**拒发**这些端口
+ * （ERR_UNSAFE_PORT / "bad port"）。随机端口（listen 0）有约千分之几的概率撞上
+ * （Windows 临时端口段里的 5060/5061/6000/6566/6665–6669/6697 等）——
+ * 撞上时回调永远进不来，登录只能干等超时。真机事故：全量测试偶发
+ * 「fetch failed: bad port」，根因就是 OS 随机派了个禁用端口。
+ */
+const FETCH_BAD_PORTS = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79,
+  87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137,
+  138, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532,
+  540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723,
+  2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+])
+
+/** 是否 fetch 禁用端口（显式配置要拒，随机抽中要重抽）。 */
+export const isFetchBadPort = (port) => FETCH_BAD_PORTS.has(Number(port))
+
+/**
+ * 起回调/载体页服务的统一 listen 包装：
+ *   · 先挂 error 再 listen（EADDRINUSE 是异步 error 事件，不挂会崩进程）；
+ *   · 只等端口绑定（毫秒级），不等用户登录；
+ *   · 随机端口（redirect.port === 0）抽中 fetch 禁用端口时**关掉重抽**；
+ *   · unref 选项给「登录窗口不该吊住宿主退出」的载体页渠道用。
+ *
+ * @param {import('node:http').Server} server
+ * @param {{port: number, bindHost: string}} redirect oauthRedirect() 的返回值
+ * @param {{unref?: boolean, attempts?: number}} [opts]
+ * @returns {Promise<number>} 实际监听端口
+ */
+export async function listenCallbackPort(server, redirect, { unref = false, attempts = 12 } = {}) {
+  for (let i = 0; ; i++) {
+    const port = await new Promise((resolve, reject) => {
+      let settled = false
+      const onError = (error) => { if (!settled) { settled = true; reject(error) } }
+      server.once('error', onError)
+      server.listen(redirect.port, redirect.bindHost, () => {
+        settled = true
+        server.removeListener('error', onError)
+        server.on('error', () => {})
+        if (unref) server.unref()
+        const addr = server.address()
+        resolve(typeof addr === 'object' && addr !== null ? addr.port : 0)
+      })
+    })
+    if (redirect.port !== 0 || !isFetchBadPort(port)) return port
+    if (i >= attempts - 1) {
+      throw new Error('回调端口连续抽中 fetch 禁用端口 —— 请用 oauthCallbackPort 指定一个固定端口')
+    }
+    await new Promise((resolve) => server.close(resolve))
+  }
+}
+
+/**
+ * 解析回调地址覆盖配置。
+ *
+ * @param {object} [options] 供应商 options（aggregate 工厂透传）。
+ *   - `oauthCallbackHost`：本机**对外可达**的 host（IP 或域名，如 tailscale IP）。
+ *     只填 host，不带协议/端口/路径；IPv6 要带方括号（`[fd7a:…::1]`）。
+ *   - `oauthCallbackPort`：固定端口（1–65535）。不填 = 0 = 随机空闲端口。
+ * @returns {{host: string, urlHost: string, port: number, bindHost: string, overridden: boolean}}
+ *   - `host`：裸 host（IPv6 不带括号）；
+ *   - `urlHost`：拼 URL 用的 host（IPv6 自动带括号）；
+ *   - `port`：listen 用端口（0 = 随机，实际端口以 listening 事件为准）；
+ *   - `bindHost`：server.listen 的绑定地址 —— 覆盖后必须绑 0.0.0.0，
+ *     否则远端机器的回调进不来；默认仍绑回环；
+ *   - `overridden`：是否启用了覆盖（渠道可据此在 instructions 里提示远程模式）。
+ * @throws 配置非法时抛可读错误（宁可登录失败提示，也不静默用错地址）。
+ *
+ * ⚠️ 安全口径：覆盖后载体页/回调口对绑定网卡可达 —— OAuth 渠道仍有
+ *    state/PKCE 回验兜底；载体页渠道请只在可信网络（如 tailscale）里启用。
+ */
+export function oauthRedirect(options = {}) {
+  const rawHost = options?.oauthCallbackHost
+  const rawPort = options?.oauthCallbackPort
+  const hasHost = typeof rawHost === 'string' && rawHost.trim() !== ''
+  const hasPort = rawPort !== undefined && rawPort !== null && String(rawPort).trim() !== ''
+  if (!hasHost && !hasPort) {
+    return { host: OAUTH_CALLBACK_DEFAULT_HOST, urlHost: OAUTH_CALLBACK_DEFAULT_HOST, port: 0, bindHost: OAUTH_CALLBACK_DEFAULT_HOST, overridden: false }
+  }
+
+  let host = OAUTH_CALLBACK_DEFAULT_HOST
+  if (hasHost) {
+    const trimmed = rawHost.trim()
+    let parsed
+    try {
+      parsed = new URL(`http://${trimmed}`)
+    } catch {
+      throw new Error(`oauthCallbackHost 不是合法的 host：「${trimmed}」（只填 IP 或域名，IPv6 带方括号，不带协议/端口/路径）`)
+    }
+    if (parsed.username !== '' || parsed.password !== '' || parsed.port !== ''
+      || parsed.pathname !== '/' || parsed.search !== '' || parsed.hash !== '') {
+      throw new Error(`oauthCallbackHost 只能填 host 本身：「${trimmed}」（不要带协议、端口、路径或查询串；端口用 oauthCallbackPort 单独填）`)
+    }
+    // ⚠️ Node 的 URL.hostname 对 IPv6 **保留方括号**（'[fd7a::1]'）——
+    //    这里统一剥成裸地址，拼 URL 时再按 ':' 补括号，否则会出现双括号。
+    host = parsed.hostname.replace(/^\[|\]$/g, '')
+  }
+
+  let port = 0
+  if (hasPort) {
+    const n = Number(rawPort)
+    if (!Number.isInteger(n) || n < 0 || n > 65535) {
+      throw new Error(`oauthCallbackPort 必须是 0–65535 的整数（0 = 随机端口），收到：「${rawPort}」`)
+    }
+    if (isFetchBadPort(n)) {
+      throw new Error(`oauthCallbackPort 不能是 ${n} —— 这是 fetch 规范的禁用端口（浏览器与 Node fetch 都拒发），换一个`)
+    }
+    port = n
+  }
+
+  // IPv6 拼 URL 必须带方括号（listen 用裸地址）
+  const urlHost = host.includes(':') ? `[${host}]` : host
+  return { host, urlHost, port, bindHost: '0.0.0.0', overridden: true }
+}
+
+// ── 回调粘贴中转（issue #3，仅覆盖模式启用）──────────────────────────────
+//
+// 远程场景下，用户在**自己机器**的浏览器里完成登录后，回调可能落在用户机器
+// 的回环上（浏览器与 magpie 不在同一台机）。此时浏览器地址栏里仍留着完整的
+// 回调 URL（code + state）—— 让用户复制整条地址粘贴回来，插件在服务端完成
+// code 交换即可（社区 autoclaw 的回调结构证明了这条路可行：交换是纯服务端
+// API 调用，不依赖回调落在哪台机器）。
+// ⚠️ 只在 `oauthRedirect().overridden === true` 时挂载这些路由 —— 桌面默认
+//    模式一个字节都不变（自动回调路在覆盖模式下也照常并行可用）。
+
+/** HTML 转义（中转页把登录 URL 塞进 href / 文本，& 等字符必须转义）。 */
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]))
+}
+
+/**
+ * 渲染「登录 + 粘贴回调」中转页（GET /relay）。
+ * 页面只用相对路径 fetch（/paste-callback），host 覆盖透明生效。
+ *
+ * @param {{displayName: string, loginUrl: string}} opts
+ */
+export function renderCallbackRelayPage({ displayName, loginUrl }) {
+  const name = escapeHtml(displayName)
+  const href = escapeHtml(loginUrl)
+  return `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${name} 登录中转</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:680px;margin:2rem auto;padding:0 1rem;line-height:1.7">
+<h1 style="font-size:1.3rem">${name} 登录</h1>
+<ol>
+<li>打开登录页并完成登录：<a href="${href}" target="_blank" rel="noopener">${href}</a></li>
+<li>如果登录后浏览器显示「无法访问 / 连接被拒绝」——说明回调落在了<b>你自己机器</b>上，这是正常的。
+请把地址栏里的<b>完整地址</b>（含 http:// 与全部参数）复制下来，粘贴到下面：</li>
+</ol>
+<textarea id="cb" rows="3" style="width:100%;box-sizing:border-box;font-family:monospace" placeholder="http://127.0.0.1:端口/callback?code=...&amp;state=..."></textarea>
+<p><button id="go" style="padding:.4rem 1.2rem">提交回调地址</button></p>
+<p id="msg" style="color:#555"></p>
+<script>
+document.getElementById('go').addEventListener('click', async () => {
+  const msg = document.getElementById('msg')
+  msg.textContent = '校验中…'
+  try {
+    const r = await fetch('/paste-callback', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: document.getElementById('cb').value }),
+    })
+    const j = await r.json()
+    msg.textContent = j.message || (j.ok ? '登录成功，可以关闭本页' : '失败')
+    msg.style.color = j.ok ? '#0a7d32' : '#b00020'
+    if (j.ok) document.getElementById('go').disabled = true
+  } catch (e) { msg.textContent = '提交失败：' + e.message }
+})
+</script>
+</body>
+</html>`
+}
+
+/**
+ * 解析用户粘贴的整条回调 URL。
+ *
+ * ⚠️ 只校验**路径**（state 校验留给调用方，各渠道口径不同）：不校验 host ——
+ *    回调可能落在用户机器的 127.0.0.1 上，与覆盖 host 不同是**预期情形**。
+ * @throws 空串 / 非法 URL / 路径不符时抛可读错误（粘贴错误不应终结登录会话，
+ *         调用方 catch 后回报错误、允许再贴一次）。
+ */
+export function parsePastedCallbackUrl(raw, expectedPath) {
+  const trimmed = String(raw ?? '').trim()
+  if (trimmed === '') throw new Error('请粘贴完整的回调地址')
+  let parsed
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    throw new Error('不是合法的 URL —— 请从浏览器地址栏复制完整地址（含 http:// 开头与全部参数）')
+  }
+  if (parsed.pathname !== expectedPath) {
+    throw new Error(`这不是本次登录的回调地址（路径应为 ${expectedPath}）—— 请复制完成登录后跳转到的那个地址`)
+  }
+  return parsed
+}
+
 /**
  * ⚠️ v0.5.0 起**没有** `saveCredential` / `loadCredential` / `credentialPath`：
  *    插件不再往 magpie 的配置目录写任何凭据文件（PR #502 审核第 2 条）。

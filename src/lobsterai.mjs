@@ -10,7 +10,8 @@
 //   POST /api/proxy/v1/chat/completions  对话（Bearer，仅 SSE，**裸流不套信封**）
 //   GET  /api/models/available           模型列表（Bearer）
 //   GET  /api/user/profile-summary       积分余额（Bearer）
-// 登录门户  https://lobsterai.youdao.com/portal#/login?...（回调到本机 127.0.0.1）
+// 登录门户  https://lobsterai.youdao.com/portal#/login?...（回调默认本机 127.0.0.1；
+//           options.oauthCallbackHost/Port 可覆盖，见 shared.mjs oauthRedirect，issue #3）
 // ```
 //
 // ## 三条必须记住的坑
@@ -30,7 +31,7 @@
 
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { untilText } from './shared.mjs'
+import { untilText, oauthRedirect, listenCallbackPort, renderCallbackRelayPage, parsePastedCallbackUrl } from './shared.mjs'
 
 export const CHANNEL_ID = 'lobsterai'
 export const DISPLAY_NAME = 'LobsterAI（有道龙虾）'
@@ -146,7 +147,10 @@ async function clientVersion() {
 // ── 登录：本地回调 + authCode 换 token ──────────────────────────────────
 
 /** 起本地回调服务，立刻返回 loginUrl + result（result 稍后 settle）。 */
-async function beginLogin(openBrowser) {
+async function beginLogin(openBrowser, opts = {}) {
+  // 回调地址收口（issue #3）：默认 127.0.0.1；options 覆盖后绑 0.0.0.0，
+  // redirect_uri 用对外可达的 host —— headless 服务器上浏览器在别的机器也能回调进来。
+  const redirect = oauthRedirect(opts.options)
   let settleOk, settleFail
   const result = new Promise((resolve, reject) => { settleOk = resolve; settleFail = reject })
   result.catch(() => {})
@@ -170,6 +174,8 @@ async function beginLogin(openBrowser) {
   }
   timer = setTimeout(() => settle(false, new Error('LobsterAI 登录超时（超过 10 分钟无回调）')), LOGIN_TIMEOUT_MS)
 
+  // 覆盖模式的中转页要引用厂商登录链接（listen 拿到端口后才拼得出来）
+  let vendorLoginUrl = ''
   server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     const sendJson = (status, data) => {
@@ -177,6 +183,32 @@ async function beginLogin(openBrowser) {
       res.end(JSON.stringify(data))
     }
     try {
+      // ── 粘贴中转（issue #3，**仅覆盖模式**；默认模式一个字节都不加）─────
+      // 浏览器与 magpie 不在同一台机时，回调可能落在用户机器的回环上 ——
+      // 地址栏里仍留着完整回调 URL，复制粘贴回来即可在服务端完成交换。
+      if (redirect.overridden && (url.pathname === '/' || url.pathname === '/relay')) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+        res.end(renderCallbackRelayPage({ displayName: DISPLAY_NAME, loginUrl: vendorLoginUrl }))
+        return
+      }
+      if (redirect.overridden && url.pathname === '/paste-callback' && req.method === 'POST') {
+        const body = await new Response(req).json().catch(() => ({}))
+        try {
+          const pasted = parsePastedCallbackUrl(body?.url, CALLBACK_PATH)
+          // ⚠️ 粘贴路的 state 校验**不终结会话**：贴错了还能再贴（与自动路不同）
+          if (pasted.searchParams.get('state') !== state) {
+            return sendJson(200, { ok: false, message: 'state 不匹配 —— 请确认复制的是本次登录跳转出的完整地址' })
+          }
+          const code = pasted.searchParams.get('code') ?? pasted.searchParams.get('authCode') ?? ''
+          if (code.length === 0) return sendJson(200, { ok: false, message: '回调地址里没有 code' })
+          const credential = await exchangeAuthCode(code, { uuid, firstKeyfrom })
+          sendJson(200, { ok: true, message: '登录成功，可以关闭此页面' })
+          settle(true, credential)
+        } catch (error) {
+          sendJson(200, { ok: false, message: error instanceof Error ? error.message : String(error) })
+        }
+        return
+      }
       if (url.pathname !== CALLBACK_PATH) {
         res.writeHead(404); res.end('not found')
         return
@@ -202,29 +234,26 @@ async function beginLogin(openBrowser) {
     }
   })
 
-  const port = await new Promise((resolve, reject) => {
-    let settled = false
-    server.once('error', (error) => {
-      if (settled) return
-      settled = true
-      reject(error)
-    })
-    server.listen(0, '127.0.0.1', () => {
-      settled = true
-      server.on('error', () => {})
-      const addr = server.address()
-      resolve(typeof addr === 'object' && addr !== null ? addr.port : 0)
-    })
-  }).catch((error) => {
+  const port = await listenCallbackPort(server, redirect).catch((error) => {
     settle(false, new Error(`LobsterAI 回调端口无法监听（${error.message}）`))
     throw error
   })
 
-  const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`
+  const redirectUri = `http://${redirect.urlHost}:${port}${CALLBACK_PATH}`
   const query = new URLSearchParams({ source: 'electron', redirect_uri: redirectUri, state })
   const url = `${PORTAL_BASE}/portal#/login?${query.toString()}`
-  if (openBrowser) openBrowser(url)
-  return { url, result, instructions: `在打开的页面完成有道龙虾登录，完成后本窗口自动继续。也可以手动打开：${url}` }
+  vendorLoginUrl = url
+  // 覆盖模式：登录入口换成中转页（登录链接 + 粘贴框）；自动回调路照常并行可用。
+  // 默认模式：入口仍是厂商登录链接，行为一格不变。
+  const entryUrl = redirect.overridden ? `http://${redirect.urlHost}:${port}/relay` : url
+  if (openBrowser) openBrowser(entryUrl)
+  // 地址不写进 instructions：宿主对话框本就把 url 渲染在可编辑框里，再嵌一遍是重复信息。
+  const instructions = redirect.overridden
+    ? `回调地址已覆盖为 ${redirect.urlHost}:${port}。请在你自己的浏览器里打开中转页（地址见下方输入框），` +
+      '按页面上的登录链接完成登录；若回调落在你自己的机器上（页面打不开），把地址栏完整地址粘贴回中转页即可。' +
+      '回调能直达本机时也会自动完成，无需粘贴。'
+    : `在打开的页面完成有道龙虾登录，完成后本窗口自动继续。`
+  return { url: entryUrl, result, instructions }
 }
 
 /**

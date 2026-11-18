@@ -593,14 +593,14 @@ if (!existsSync(MARVIS_URL)) {
     )
   })
 
-  test('loginMethods：QQ / 微信 / 本机导入三条路（无粘贴兜底），arg 由 aggregate 透传', () => {
+  test('loginMethods：QQ / 微信 / 本机导入 / QQ / 微信粘贴回调五条路，arg 由 aggregate 透传', () => {
     assert.deepEqual(
       MARVIS_LOGIN_METHODS.map((m) => m.arg),
-      ['QC', 'WX', 'desktop'],
+      ['QC', 'WX', 'desktop', 'paste-QC', 'paste-WX'],
     )
     for (const m of MARVIS_LOGIN_METHODS) assert.ok(m.label.length > 0)
     assert.equal(typeof marvisChannel.beginLogin, 'function')
-    assert.equal(marvisChannel.apiAuth, undefined, '不留粘贴入口')
+    assert.equal(marvisChannel.apiAuth, undefined, '不留裸凭据粘贴入口（粘贴回调走 method:code）')
   })
 
   // ── 7. 续期：expired / refresh / chat 401 硬续期（离线 stub）────────────────

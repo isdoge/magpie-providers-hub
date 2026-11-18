@@ -44,6 +44,7 @@
 
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
+import { oauthRedirect, listenCallbackPort } from './shared.mjs'
 import {
   launchLoginBrowser,
   closeSession,
@@ -727,7 +728,11 @@ document.getElementById('go').onclick = async () => {
  * beginLogin：拉起浏览器（独立 profile、可见、detached）→ 用户登控制台 →
  * CDP 读两枚 cookie → 大模型商店换 sk- → settle。粘贴路随时可用（本地页表单）。
  */
-async function beginLogin(openBrowser) {
+async function beginLogin(openBrowser, opts = {}) {
+  // 载体页地址收口（issue #3）：默认 127.0.0.1；options 覆盖后绑 0.0.0.0，
+  // 远程浏览器经对外可达 host 打开登录页（浏览器自动路仍在本机拉 Chromium，
+  // headless 无浏览器时走页内粘贴 Key 路）。
+  const redirect = oauthRedirect(opts.options)
   let settleOk, settleFail
   const result = new Promise((resolve, reject) => { settleOk = resolve; settleFail = reject })
   result.catch(() => {})
@@ -781,21 +786,12 @@ async function beginLogin(openBrowser) {
     }
   })
 
-  const port = await new Promise((resolve, reject) => {
-    let done = false
-    server.once('error', (error) => { if (!done) { done = true; reject(error) } })
-    server.listen(0, '127.0.0.1', () => {
-      done = true
-      server.unref()
-      const addr = server.address()
-      resolve(typeof addr === 'object' && addr !== null ? addr.port : 0)
-    })
-  }).catch((error) => {
+  const port = await listenCallbackPort(server, redirect, { unref: true }).catch((error) => {
     settle(false, new Error(`百智云回调端口无法监听（${error.message}）`))
     throw error
   })
 
-  const url = `http://127.0.0.1:${port}/login`
+  const url = `http://${redirect.urlHost}:${port}/login`
   if (openBrowser) openBrowser(url)
 
   // 后台登录循环：等两枚 cookie → 换 Key → settle（换不到 Key 时进宽限轮询）
@@ -837,7 +833,7 @@ async function beginLogin(openBrowser) {
   return {
     url,
     result,
-    instructions: `在打开的页面里登录 baizhi.cloud（微信扫码），登录后自动取 Key；也可以在页面下方直接粘贴。手动打开：${url}`,
+    instructions: `在打开的页面里登录 baizhi.cloud（微信扫码），登录后自动取 Key；也可以在页面下方直接粘贴。`,
   }
 }
 

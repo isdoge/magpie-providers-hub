@@ -118,7 +118,8 @@ magicrew 的 granted:false → claimed+site.dailyGrant）。done 只留给
 - **没有系统通知，也不许再加**：老实现用 spawnSync 跑 PowerShell 拼 toast XML，
   外部文案（厂商报错、账号昵称）拼进单引号字符串 ⇒ **命令注入**（PR #502 审核
   实测可执行任意命令）。现在所有反馈只走 `client.tui.showToast`，且**插件不再
-  spawn 子进程**（唯一例外：MagiCrew 登录要拉起本机 Chrome 读 localStorage）。
+  spawn 子进程**（例外：MagiCrew 登录要拉起本机 Chrome 读 localStorage；
+  豆包工作 CDP 浏览器登录拉一次性窗口，2026-11-17 用户批准）。
 - **不写任何宿主文件**：凭据只在内存（`memoryCredentials`）+ magpie 账号槽；
   诊断日志要 `DSH_HUB_DEBUG=1` 才写，落点是**系统临时目录**。
 - **插件更新**：GitHub 源（`github:owner/repo` spec）走 `magpie plugin update`

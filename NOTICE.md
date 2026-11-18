@@ -71,3 +71,25 @@ Raccoon、MiniMax Code、ZCode、Gemini），故这些**不在**本插件内 —
   `chat` 代理（目录短名 → 完整模型 id）、用量窗口组装。
 - **商标**：七牛云 / Qiniu / Conatus 及其模型名归七牛云及其各自权利人所有。本插件只让用户
   用**自己的账号**访问七牛云已开通的服务。
+
+### 豆包工作渠道（`hub-doubaowork`）— 移植自 miaocell/magpie-doubao-work-auth
+
+- **来源**：[miaocell/magpie-doubao-work-auth](https://github.com/miaocell/magpie-doubao-work-auth)
+  （MIT，Copyright (c) 2026 Doubao Work Magpie plugin contributors；原文见
+  [LICENSES/magpie-doubao-work-auth-MIT.txt](./LICENSES/magpie-doubao-work-auth-MIT.txt)）。
+- **移植范围**：会话/请求参数（上游 `lib/session.mjs`）、chat 全流程（协议/SSE 补丁流/
+  Responses 折叠/模型菜单）、额度三池、签到只读判定、临时会话清理（`lib/lease.mjs`）、
+  错误映射、Cookie 解析。协议纯函数在 `src/doubaowork-protocol.mjs`。
+- **本仓库新增**：hub「一渠道一供应商」接线、本地载体页粘贴 Cookie 登录、magpie 原生
+  apiAuth 粘贴兜底、滚动指针额度分档（`expiryBandedWindows`）。
+- **与上游的差异**（hub 规矩逼出来的，渠道文件头逐条写明）：CDP 浏览器登录移植
+  （桌面一次性窗口 = magicrew 同款 spawn 例外，2026-11-17 用户批准；另适配无界面
+  Linux：`doubaoCdpHost/Port` 读外部浏览器调试端口，ws 地址按可达 host 重写）；
+  「读桌面客户端 DPAPI」那条不移植（敏感面，等另行批准）；vault 与清理记录不落盘
+  （改纯内存，进程被杀时孤儿临时会话无法补删，如实记录）；chat 不挂 180s 硬超时；
+  签到「今天已领」报 claimed；图片明确拒绝 400（上传入口要前端 a_bogus 签名，纯
+  HTTP 造不出）。
+- **发布状态**：本机按需渠道，**不随 npm 包发布**（.gitignore 私有段，未获作者允许前
+  不入库；与 lingxi/dola 同段）。
+- **商标**：豆包 / Doubao 及其模型名归字节跳动及其各自权利人所有。本插件只让用户用
+  **自己的账号**访问豆包工作已开通的服务。

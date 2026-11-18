@@ -25,6 +25,7 @@ import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir, hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:net'
+import { isFetchBadPort } from './shared.mjs'
 
 /** 卡片上的供应商名：必须 `<中文> <English>` */
 // 名称沿用移植来源 deepseek-harness-codearts 的 marvis-product.ts（「腾讯 Marvis」）。
@@ -497,14 +498,20 @@ async function chat(acct, request, opts = {}) {
   } catch (err) {
     return errorResponse(503, 'header_unavailable', `请求头构造失败：${err?.message ?? err}`)
   }
-  // 保留调用方原有的头，只覆盖鉴权那几项
-  // ⚠ 合并方向必须**反过来**：上游头先铺底，调用方只补协议头之外的东西。
-  //   早前是「调用方的 contentType 覆盖我们的」，一旦宿主传 `text/event-stream`
-  //   就把 `application/json` 盖掉，上游按非 JSON 拒（参考 loader 也是这个方向）。
+  // 调用方的头只**补充**我们没有的项；我们铺好的头（鉴权 / UA / 协议）一律不被覆盖。
+  // ⚠⚠ 必须**按小写判重**（MYCF711/magpie-marvis 0.2.56 同款修复）：
+  //   早前按原键名覆盖，调用方传小写 `user-agent` 时会与我们的 `User-Agent`
+  //   并存 —— fetch 构造 Headers 把两条**用逗号连成一条**，上游收到
+  //   `magpie/x.y, AsyncOpenAI/Python 2.32.0`，既不是官方 UA 又可能触发
+  //   4100404 风控。现在同名（任意大小写）直接跳过：官方 UA 永远原样。
+  const seenLower = new Set(Object.keys(headers).map((k) => k.toLowerCase()))
   for (const [key, value] of Object.entries(request?.headers ?? {})) {
     if (typeof value !== 'string') continue
     if (/^content-(type|length|encoding)$/i.test(key)) continue
-    if (key.toLowerCase() === 'authorization') continue
+    const lower = key.toLowerCase()
+    if (lower === 'authorization') continue
+    if (seenLower.has(lower)) continue
+    seenLower.add(lower)
     headers[key] = value
   }
   // body 被改写过 → 让 fetch 重算长度
@@ -644,7 +651,7 @@ async function walletWindows(credential) {
 // ══ 登录：QQ / 微信 OAuth + 从本机 Marvis 导入 ════════════════════════════
 //
 // 压平自参考实现的 hooks/methods.mjs + marvis/{login,browser,desktop,device,expiry,profile}.mjs。
-// 三条登录路 + 粘贴入口（apiAuth）兜底，与参考 methods() 的形态一致：
+// 五条登录路（QQ/微信隔离浏览器、本机导入、QQ/微信粘贴回调），与参考 methods() 的形态一致：
 //   · QQ / 微信：起**隔离浏览器**（一次性 profile、Marvis Electron UA、抹 navigator.webdriver），
 //     CDP `Fetch.requestPaused` 在**请求阶段**拦下回调（请求不出网，code 保持未消费），
 //     再由 Node 带**本次登录专属的虚拟 guid** 把 code 换唯一那一次。
@@ -774,6 +781,13 @@ function stateOfUrl(url) {
 /** 登录过程中的 state → 虚拟设备 guid 映射（模块级单表，按 state 隔离多账号） */
 const pendingDevices = createDeviceRegistry()
 
+/**
+ * 粘贴回调登录路的 state → guid（与自动路分表）。
+ * 它比自动流程慢（用户要扫码、再把地址栏复制回来），10 分钟不够，给 30 分钟。
+ * 仍然一次性：同一条回调地址换过一次就作废（换取失败会放回去，允许重试）。
+ */
+const pendingManual = createDeviceRegistry({ ttlMs: 30 * 60_000 })
+
 // ── OAuth 授权码换取（login.mjs 压平）─────────────────────────────────────
 
 /**
@@ -834,6 +848,21 @@ function loginTypeCode(raw) {
   const s = String(raw ?? '')
   if (s === '2') return '2'
   return /^WX/i.test(s) ? '2' : '1'
+}
+
+/**
+ * 从 `callback` 收到的参数里挑出「用户粘贴的内容」（粘贴回调登录路用）。
+ *
+ * ⚠ 宿主对 `method: "code"` 的调用形态两种都见过：`callback(粘贴内容)` 与
+ *   `callback(url, 粘贴内容)`（MYCF711/magpie-marvis 实机口径）。两种都认：
+ *   优先取**能抠出 code** 的那个参数，都不像时取最后一个非空字符串 ——
+ *   让用户拿到「粘贴的内容里没有 code」这种可读错误，而不是静默失败。
+ */
+function pastedInputOf(a, b) {
+  const cands = [a, b].filter((v) => typeof v === 'string' && v.trim())
+  if (!cands.length) return ''
+  for (const c of cands) if (extractCode(c)) return c
+  return cands[cands.length - 1]
 }
 
 /**
@@ -1268,15 +1297,21 @@ function resetBrowserCache() {
 }
 
 async function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = createServer()
-    srv.unref()
-    srv.on('error', reject)
-    srv.listen(0, '127.0.0.1', () => {
-      const port = srv.address().port
-      srv.close(() => resolve(port))
+  // ⚠️ 随机端口可能抽中 fetch 禁用端口（6000/6666 等）—— 浏览器导航会先被
+  //    ERR_UNSAFE_PORT 挡下，回调拦不到。抽中即重抽（与 shared.listenCallbackPort 同因）。
+  for (let i = 0; i < 12; i++) {
+    const port = await new Promise((resolve, reject) => {
+      const srv = createServer()
+      srv.unref()
+      srv.on('error', reject)
+      srv.listen(0, '127.0.0.1', () => {
+        const p = srv.address().port
+        srv.close(() => resolve(p))
+      })
     })
-  })
+    if (!isFetchBadPort(port)) return port
+  }
+  throw new Error('连续抽中 fetch 禁用端口，无法为登录回调挑选可用端口')
 }
 
 async function getJson(url, timeoutMs = 3000) {
@@ -2003,11 +2038,13 @@ async function refreshMarvis(credential, persist) {
 // 重活全部在 `result` 里（deferred 起步：连 findBrowser 的注册表扫描都不挡返回）。
 // ⚠ `opened: true` 是必须的：没它宿主会拿 `url` 再开一个系统默认浏览器窗口。
 
-/** 三条登录路（oauth 入口，粘贴入口 apiAuth 在后兜底） */
+/** 五条登录路：QQ/微信隔离浏览器、本机导入、QQ/微信粘贴回调（headless 用） */
 const LOGIN_METHODS = [
   { label: 'QQ 登录（隔离浏览器窗口）', arg: 'QC' },
   { label: '微信登录（隔离浏览器窗口）', arg: 'WX' },
   { label: '从本机 Marvis 导入（需已安装并登录）', arg: 'desktop' },
+  { label: 'QQ 登录（粘贴回调地址）', arg: 'paste-QC' },
+  { label: '微信登录（粘贴回调地址）', arg: 'paste-WX' },
 ]
 
 const LOGIN_INSTRUCTIONS = {
@@ -2020,6 +2057,14 @@ const LOGIN_INSTRUCTIONS = {
     '2) 用微信扫码并确认\n' +
     '3) 授权完成后窗口会自己关掉，回到 magpie 即可',
   desktop: '正在读取本机 Marvis 登录态…（需已安装 Marvis 并在客户端里登录过）',
+  'paste-QC':
+    '1) 会用你自己的浏览器打开 QQ 授权页（手机扫码也行）\n' +
+    '2) 登录并确认授权后，浏览器停在 `yybadaccess.3g.qq.com/…marvis_oauth?login_type=QC&code=…`\n' +
+    '3) 把地址栏那条地址整条复制，粘贴到输入框（magpie 跑在没有浏览器的服务器上时用这条）',
+  'paste-WX':
+    '1) 会用你自己的浏览器打开微信扫码页（手机扫码即可）\n' +
+    '2) 扫码确认后，浏览器停在 `yybadaccess.3g.qq.com/…marvis_oauth?login_type=WX&code=…`\n' +
+    '3) 把地址栏那条地址整条复制，粘贴到输入框（magpie 跑在没有浏览器的服务器上时用这条）',
 }
 
 /** deferred：fn 的重活推到宏任务里跑，beginLogin 不等它 */
@@ -2124,6 +2169,82 @@ function oauthLoginFlow(loginType, deps) {
   return { url, opened: true, instructions: LOGIN_INSTRUCTIONS[loginType], result }
 }
 
+/**
+ * QQ / 微信**粘贴回调地址**登录流（headless / NAS / 容器：没有浏览器也没有
+ * Windows 客户端时走这条 —— MYCF711/magpie-marvis 的 manualPasteLogin 同款）。
+ *
+ * 与 oauthLoginFlow 的区别只有两点：
+ *   1. **不**自己开浏览器 —— 返回 `method: 'code'`，宿主把授权页交给用户自己的
+ *      浏览器，登录完由宿主收一段粘贴进来的文本（回调 URL / 裸 code 都认）；
+ *   2. guid 用**本次授权生成的那个**，靠粘贴回来的 state 对上（QQ 的 state 是
+ *      随机小数，微信的 state 就是 guid）。
+ *
+ * ⚠ 不设 `opened: true` —— 设了宿主就不弹页，用户看不到二维码。
+ * ⚠ state→guid 只在**换取成功后**消费：空输入 / 贴错 / 换取失败都能原样重试
+ *   （失败把映射放回去）；成功后同一条回调地址再贴就判「已失效」。
+ * ⚠ `settle(a, b)` 是 aggregate 的 callback 透传进来的粘贴参数（两种形态都认，
+ *   见 pastedInputOf）；成功时同时兑现 `result`（aggregate 的反馈链挂在它上面）。
+ */
+function manualPasteLoginFlow(loginType, deps) {
+  const guid = newDeviceGuid()
+  const url = authorizeUrl(loginType, guid)
+  const expectedState = stateOfUrl(url) || guid
+  pendingManual.remember(expectedState, guid)
+
+  let resolveResult
+  const result = new Promise((resolve) => { resolveResult = resolve })
+  let consumed = false
+
+  const settle = async (a, b) => {
+    if (consumed) {
+      throw new Error('登录流程已失效（这条回调地址已经换取成功过）。要再登一个号请重新点一次登录。')
+    }
+    const pasted = pastedInputOf(a, b)
+    if (!pasted) {
+      throw new Error('没有收到回调地址：登录完请把浏览器地址栏里那条 `…marvis_oauth?code=…&state=…` 整条粘贴回来。')
+    }
+    // ⚠ 先确认里面真有 code，再动 registry：空输入/贴错东西时不许把这次登录作废
+    if (!extractCode(pasted)) {
+      throw new Error('粘贴的内容里没有 code：请把地址栏里那条 `…marvis_oauth?login_type=…&code=…&state=…` 整条复制。')
+    }
+    const state = stateOfCallback(pasted)
+    if (!state) {
+      throw new Error('粘贴的内容里没有 state：请重新复制地址栏里那条回调地址。')
+    }
+    if (state !== expectedState) {
+      throw new Error('state 与本次登录不符 —— 请确认复制的是**这次**授权页跳转出的回调地址（别混用多个登录窗口的地址）。')
+    }
+    const virtualGuid =
+      pendingManual.take(state) || (loginType === 'WX' && /^[0-9a-f]{32}$/i.test(state) ? state : '')
+    if (!virtualGuid) {
+      throw new Error('登录流程已失效（找不到这次登录的设备标识，可能已超时）。请重新点一次登录。')
+    }
+    try {
+      let acct = await deps.parseCallback(pasted, '', { loginType, guid: virtualGuid })
+      acct = await withProfile({ ...acct, guid: virtualGuid }, loginType, deps)
+      const credential = loginCredential(
+        { ...acct, guid: virtualGuid, loginType: acct.loginType ?? LOGIN_TYPE[loginType] ?? '1' },
+        loginType,
+      )
+      consumed = true
+      resolveResult(credential)
+      return credential
+    } catch (err) {
+      // 换取失败（网络/上游抖动）：把 state→guid 放回去，允许同一条回调地址重试
+      pendingManual.remember(state, virtualGuid)
+      throw err
+    }
+  }
+
+  return {
+    url,
+    method: 'code',
+    instructions: LOGIN_INSTRUCTIONS[`paste-${loginType}`],
+    result,
+    settle,
+  }
+}
+
 /** 从本机 Marvis 导入（读进程内存，无浏览器） */
 function desktopLoginFlow(deps) {
   const result = deferred(async () => {
@@ -2142,7 +2263,7 @@ function desktopLoginFlow(deps) {
 
 /**
  * 渠道登录入口。
- * @param {{ arg?: 'QC'|'WX'|'desktop', _deps?: object }} [opts]
+ * @param {{ arg?: 'QC'|'WX'|'desktop'|'paste-QC'|'paste-WX', _deps?: object }} [opts]
  *   `_deps` 是离线测试的注入缝（stub 掉浏览器/换取/内存导入），生产不传。
  */
 function beginLogin(opts = {}) {
@@ -2157,6 +2278,8 @@ function beginLogin(opts = {}) {
     ...opts._deps,
   }
   if (arg === 'desktop') return desktopLoginFlow(deps)
+  if (arg === 'paste-QC') return manualPasteLoginFlow('QC', deps)
+  if (arg === 'paste-WX') return manualPasteLoginFlow('WX', deps)
   return oauthLoginFlow(arg === 'WX' ? 'WX' : 'QC', deps)
 }
 
@@ -2166,9 +2289,9 @@ export const marvisChannel = {
   id: 'marvis',
   displayName: DISPLAY_NAME,
 
-  // ⚠️ 没有 apiAuth 粘贴入口：按 deepseek-harness-codearts 的 marvis 形态，
-  //    登录只走 QQ / 微信 OAuth（或从本机 Marvis 导入），不留手工粘贴兜底。
-  //    凭据由 beginLogin 换回后写进账号槽，chat/usage 直接读槽上的四件套。
+  // ⚠️ 没有 apiAuth（裸凭据粘贴）入口：凭据由登录路换取后写进账号槽，
+  //    chat/usage 直接读槽上的四件套。headless 场景走 loginMethods 里的
+  //    「粘贴回调地址」两条（method:'code'，粘的是 OAuth 回调 URL，不是凭据）。
 
   fallbackModels: fallbackModels(),
   /**
@@ -2182,16 +2305,16 @@ export const marvisChannel = {
   catalog,
 
   /**
-   * 浏览器 OAuth（QQ / 微信）与「从本机 Marvis 导入」—— 三条登录路，
-   * `loginMethods` 的 `arg` 区分入口（aggregate 的 buildOne 透传）。
-   * 没有粘贴入口：凭据只能由这些登录路换取。
+   * 浏览器 OAuth（QQ / 微信）、「从本机 Marvis 导入」与「粘贴回调地址」（QQ / 微信，
+   * headless 用，method:'code'）—— 五条登录路，`loginMethods` 的 `arg` 区分入口
+   * （aggregate 的 buildOne 透传）。
    */
   beginLogin: (openBrowser, opts = {}) => beginLogin(opts),
   loginMethods: LOGIN_METHODS,
 
   /**
    * chat 的凭据就是账号槽对象（beginLogin 换回的四件套 + refreshToken）。
-   * 没有粘贴入口，所以这里不再读 `credential.key`。
+   * 没有 apiAuth 裸凭据入口，所以这里不再读 `credential.key`。
    *
    * ⚠ 契约：**返回 Response，不抛**（抛错会让 magpie 拿不到 headers → 502 undefined）。
    */
@@ -2257,6 +2380,7 @@ export {
   acctOf as marvisAcctOf,
   authorizeUrl as marvisAuthorizeUrl,
   extractCode as marvisExtractCode,
+  pastedInputOf as marvisPastedInputOf,
   parseCallback as marvisParseCallback,
   parseSetCookies as marvisParseSetCookies,
   accountFromCookies as marvisAccountFromCookies,
@@ -2270,6 +2394,7 @@ export {
   parseLoginState as marvisParseLoginState,
   accountLabel as marvisAccountLabel,
   pendingDevices as marvisPendingDevices,
+  pendingManual as marvisPendingManual,
   refreshMarvis as marvisRefresh,
   credentialExpired as marvisCredentialExpired,
 }

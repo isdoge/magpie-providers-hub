@@ -271,12 +271,19 @@ test('登录新账号 → toast「登录成功（新增账号）」', async () =
     const h = await loginHarness({ mod, client: t.client, accountId: '新账号' })
     try {
       const handle = await h.plugin.auth.methods[0].authorize()
-      await handle.callback()
+      const auth = await handle.callback()
       await new Promise((r) => setTimeout(r, 50))
       assert.ok(t.toasts.some((m) => /登录成功/.test(m)), `应弹登录成功，实际：${t.toasts.join(' | ')}`)
       assert.ok(t.saved.length >= 1, '凭据要交给 magpie 账号槽（client.auth.set）')
       assert.equal(t.saved[0].body.type, 'success')
       assert.equal(t.saved[0].body.channel, 'astudio')
+      // 宿主 keptAs()/save() 契约（plugins#998 同款坑，2026-11-17 真机报障
+      // 「sign-in gave nothing to keep」）：OAuth 结果必须带 refresh/key/access
+      // 之一。astudio 无 refresh_token ⇒ refresh 别名落空串、access 取 accessToken。
+      assert.ok('refresh' in auth, 'callback 返回值必须带 refresh 字段（宿主 keptAs 契约）')
+      assert.equal(auth.access, 'AT-NEW', 'access 别名要映射 accessToken')
+      assert.equal(auth.refresh, '', '无续期渠道 refresh 落空串（keptAs 仍认）')
+      assert.equal(t.saved[0].body.access, 'AT-NEW', '落槽形状同样带宿主契约字段')
     } finally {
       h.restore()
     }
@@ -297,9 +304,13 @@ test('重复登录一个仍未过期的账号 → toast「账号重复」且不�
     const h = await loginHarness({ mod, client: t.client, accountId: 'A' })
     try {
       const handle = await h.plugin.auth.methods[0].authorize()
-      await handle.callback()
+      const dup = await handle.callback()
       await new Promise((r) => setTimeout(r, 50))
       assert.equal(t.saved.length, 0, '未过期的重复登录不该覆盖原槽')
+      // 宿主会对 success 自己落槽（会话 key）⇒ 重复登录必须返回 failed，
+      // 否则多出删不掉的鬼影槽（2026-11-17 keptAs 契约修复配套）。
+      assert.equal(dup.type, 'failed', '重复登录返回 failed，宿主不落盘')
+      assert.match(dup.error, /账号重复/)
       assert.ok(t.toasts.some((m) => /账号重复/.test(m)), `应提示账号重复，实际：${t.toasts.join(' | ')}`)
     } finally {
       h.restore()

@@ -38,6 +38,7 @@
 
 import { createHash, createHmac } from 'node:crypto'
 import { createServer } from 'node:http'
+import { oauthRedirect, listenCallbackPort } from './shared.mjs'
 import {
   buildAnthropicPayload,
   anthropicSseToOpenAi,
@@ -818,7 +819,11 @@ document.getElementById('go').onclick = async () => {
  * ⚠️ 匿名会话 cookie 在窗口打开时就存在 —— 「读到 cookie」≠「已登录」，
  *   兑换 401 时必须继续等（isMonkeycodeSessionExpiredError 语义）。
  */
-async function beginLoginFor(site, openBrowser) {
+async function beginLoginFor(site, openBrowser, options = {}) {
+  // 载体页地址收口（issue #3）：默认 127.0.0.1；options 覆盖后绑 0.0.0.0，
+  // 远程浏览器经对外可达 host 打开登录页（浏览器自动路仍在本机拉 Chromium，
+  // headless 无浏览器时走页内粘贴 API Key 路）。
+  const redirect = oauthRedirect(options)
   // ⚠️ 15 分钟：浏览器登录要用户在官方页完成操作，6 分钟实测不够（真机 2026-11-04
   //   用户登录到一半窗口到点 → settle(false) 关服务，页面残留「等待会话」）
   const LOGIN_WINDOW_MS = 15 * 60 * 1000
@@ -892,21 +897,7 @@ async function beginLoginFor(site, openBrowser) {
     }
   })
 
-  const port = await new Promise((resolve, reject) => {
-    let settled = false
-    server.once('error', (error) => {
-      if (settled) return
-      settled = true
-      reject(error)
-    })
-    server.listen(0, '127.0.0.1', () => {
-      settled = true
-      server.unref()
-      server.on('error', () => {})
-      const addr = server.address()
-      resolve(typeof addr === 'object' && addr !== null ? addr.port : 0)
-    })
-  }).catch((error) => {
+  const port = await listenCallbackPort(server, redirect, { unref: true }).catch((error) => {
     settle(false, new Error(`${site.displayName} 登录端口无法监听（${error.message}）`))
     throw error
   })
@@ -961,7 +952,7 @@ async function beginLoginFor(site, openBrowser) {
     }
   })()
 
-  const url = `http://127.0.0.1:${port}/login`
+  const url = `http://${redirect.urlHost}:${port}/login`
   if (openBrowser) openBrowser(url)
   return {
     url,
@@ -981,7 +972,7 @@ function makeChannel(site) {
     // 只把 `deepseek-flash` 发给网关 → 网关 403 Forbidden（真机实测）。
     modelHasSlash: true,
     fallbackModels: catalogOf(),
-    beginLogin: (openBrowser) => beginLoginFor(site, openBrowser),
+    beginLogin: (openBrowser, opts = {}) => beginLoginFor(site, openBrowser, opts.options),
     loginMethods: [{ label: '浏览器登录（官方页登录自动换 Key）或手动粘贴' }],
     // ⚠️ 无 refresh 端点（诚实标记）：网关 Key 是长期静态材料
     async refresh() {

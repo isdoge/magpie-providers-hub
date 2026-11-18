@@ -215,6 +215,20 @@ const identityOf = (credential) =>
   String(credential?.refreshToken ?? credential?.refresh_token ?? credential?.access
     ?? credential?.access_token ?? credential?.accessToken ?? '')
 
+/**
+ * 宿主约定字段别名（OpenCode 惯例）。magpie 宿主的 keptAs()/save() 只认
+ * `refresh` / `key` / `access` 三字段：OAuth 结果缺它们就报
+ * 「sign-in gave nothing to keep」（plugins#998 同款坑，2026-11-17 真机报障）。
+ * 渠道凭据字段名各异（accessToken / apiKey / …），这里补别名；原字段经
+ * `...credential` 原样保留，本渠道读取侧仍用原字段，宿主 save() 的 ...extra
+ * 也会把它们带进账号槽，两条写入路径形状兼容。
+ */
+const hostAccessOf = (credential) =>
+  String(credential?.accessToken ?? credential?.access_token ?? credential?.access
+    ?? credential?.apiKey ?? credential?.api_key ?? credential?.token ?? '')
+const hostRefreshOf = (credential) =>
+  String(credential?.refreshToken ?? credential?.refresh_token ?? credential?.refresh ?? '')
+
 // ── 凭据：**只在内存里**，绝不落盘 ──────────────────────────────────────
 //
 // ⚠️ PR #502 审核（yetone）第 2 条：插件不得往 magpie 的配置目录写文件。
@@ -1088,7 +1102,8 @@ export const makeHubPlugin = (channel) => async (input, options = {}) => {
       // 本供应商唯一的登录入口（一个渠道一个供应商）。⚠️ 约定（对齐社区插件）：
       // authorize() 必须**立刻**返回 { url, method, callback } —— 在这里 await
       // 用户完成登录会与 magpie 双向死锁；真正等登录的是 callback()。
-      // 渠道契约 beginLogin() → { url, result }。
+      // 渠道契约 beginLogin() → { url, result }；可选 `method: 'code'` + `settle(...args)`
+      // （粘贴型：宿主给输入框，callback 把粘贴内容透传给 settle，成功时兑现 result）。
       // 渠道可声明多登录入口（`loginMethods: [{label, arg}]`）；
       // 未声明时退化为单入口 `登录 <displayName>`。
       methods: ((channel) => {
@@ -1108,7 +1123,9 @@ export const makeHubPlugin = (channel) => async (input, options = {}) => {
           async authorize() {
                   // ⚠ 把 loginMethods 条目的 `arg` 透传给渠道：多登录入口（如 marvis 的
                   //   QQ / 微信 / 本机导入）靠它区分点了哪个；不收参的渠道忽略即可。
-                  const started = await channel.beginLogin(openBrowser, { arg })
+                  //   options 一并透传：回调地址覆盖（oauthCallbackHost/Port，issue #3）
+                  //   由渠道经 shared.mjs 的 oauthRedirect(options) 读取。
+                  const started = await channel.beginLogin(openBrowser, { arg, options })
                   // 登录前的本渠道账号槽：既判「重复登录是否已过期」，也用于认领旧槽
                   // （昵称缺失时代被写成渠道显示名的那种，见 resolveAccountId）。
                   const ownSlots = readOwnAuthEntries({ providerId: PROVIDER, withValue: true })
@@ -1191,18 +1208,25 @@ export const makeHubPlugin = (channel) => async (input, options = {}) => {
           }).catch((e) => { debugLog(`chain rejected: ${e.message}`) })
           return {
             url: started.url,
-            method: 'auto',
+            // 渠道可声明 `method: 'code'`（如 marvis 的粘贴回调登录路）：宿主渲染
+            // 输入框、把用户粘贴的内容交给 callback；其余一律 'auto'（默认）。
+            method: started.method === 'code' ? 'code' : 'auto',
             // ⚠️ `opened: true` = 插件**自己已经打开了浏览器窗口**，请宿主不要再开一次。
             //    没有它的话，magpie 会在用户的默认浏览器里再打开同一个地址 ——
             //    真机 2026-10-31（灵犀）：两个窗口长得一样，用户在默认浏览器里登录，
             //    插件盯着自己的临时窗口，5 分钟后超时「登录失败」。
+            //    ⚠ code 型入口**不能**带 opened —— 带了宿主就不弹授权页（marvis 粘贴路）。
             ...(started.opened === true ? { opened: true } : {}),
             instructions: started.instructions
               ?? `在打开的页面里完成 ${channel.displayName} 登录，本窗口会自动继续。`,
-            async callback() {
+            // ⚠ code 型：宿主把粘贴内容传进来（`callback(内容)` 或 `callback(url, 内容)`
+            //   两种形态都见过），原样透传给渠道的 settle；auto 型无参，等 result。
+            async callback(...args) {
               debugLog(`magpie callback invoked: ${channel.id}`)
               try {
-                const credential = await started.result
+                const credential = typeof started.settle === 'function'
+                  ? await started.settle(...args)
+                  : await started.result
                 const expires = expiresMsOf(credential)
                 // 账号槽（主）+ 内存缓存（本进程内供 sweep/目录用）。
                 // accountId 优先用渠道带回的账号名 —— 多账号时卡片显示真名。
@@ -1210,14 +1234,25 @@ export const makeHubPlugin = (channel) => async (input, options = {}) => {
                   type: 'success',
                   channel: channel.id,
                   ...credential,
+                  // 宿主 keptAs() 契约字段（见 hostAccessOf 注释）：缺了会报
+                  // 「gave nothing to keep」，哪怕登录本身成功。
+                  access: hostAccessOf(credential),
+                  refresh: hostRefreshOf(credential),
                   ...(expires !== undefined ? { expires } : {}),
                   accountId: resolveAccountId(credential),
                 }
                 // ⚠️ 防重复：重复登录一个仍然有效的账号 → **不覆盖原账号槽**
-                //    （保留原凭据/账号；仍把 auth 返回给 magpie 以免流程报错）。
+                //    宿主 keptAs 契约修复后，宿主会对 callback 返回的 success
+                //    **自己再落一次槽**（写到本次会话的 account key，见宿主
+                //    save()/keyFor()）⇒ 这里若仍返回 success，重复登录会多出
+                //    一个 magpie 只给 set 不给 remove、删不掉的鬼影槽。
+                //    返回 failed 让宿主不落盘；提示由完成链 toast 与本文案承担。
                 if (isHealthyDuplicate(credential)) {
                   debugLog(`callback: 账号重复，跳过写入（保留原槽）${channel.id} ${auth.accountId}`)
-                  return auth
+                  return {
+                    type: 'failed',
+                    error: `${channel.displayName}：账号重复 —— ${auth.accountId} 仍有效，已保留原账号（未覆盖）`,
+                  }
                 }
                 rememberCredential(channel, credential)
                 await saveAuth(auth)

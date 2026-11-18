@@ -85,6 +85,23 @@ PR #502 的一轮审核（magpie-community/plugins）指出两件事，都成立
 | `loomy` | `hub-loomy` | Loomy（讯飞） | **微信扫码**（独有）/ 短信验证码 | `/api/v1/models` + 内置快照 | ❌ 无 token 续期（会话 14 天） |
 | `baizhi` | `hub-baizhi` | 百智云（BaiZhiCloud） | 粘贴 API Key（sk-…）| `/api/anthropic/v1/models`（Anthropic 协议） | ❌ 静态 Key 无续期（长期有效） |
 
+### doubaowork（豆包工作，**本机按需、不随包**）
+
+移植自 [miaocell/magpie-doubao-work-auth](https://github.com/miaocell/magpie-doubao-work-auth)
+（MIT，署名见 NOTICE.md）。登录态是 doubao.com 的网站 Cookie，三条登录路：
+**① 浏览器登录免粘贴**——桌面拉一次性 Edge/Chrome 窗口（magicrew 同款 spawn 例外），
+扫码/短信登录后 CDP 读 Cookie 自动完成；**无界面 Linux** 用插件选项
+`doubaoCdpHost`/`doubaoCdpPort` 指向你**外部浏览器**的调试端口（可信网络可达，
+如 tailscale；浏览器需带 `--remote-debugging-port` 启动），你在那只浏览器登录、
+服务端自动抓取，免粘贴（Chrome 报的 ws 地址恒 127.0.0.1，插件按可达 host 重写）。
+**② 载体页粘贴 Cookie**（服务端验身份 + launch 后才 settle，校验失败可重试；
+覆盖模式下载体页跟随覆盖 host，无界面可用）；**③ magpie 原生粘贴框兜底**。
+上游「读桌面客户端 DPAPI」那条不移植（敏感面）。**无续期端点**（refresh 诚实 throw，
+服务端 710012001 标失效）。每次对话用临时会话（conversation_type=3）用完即删、归属
+校验防误删；清理记录纯内存 ⇒ 进程被杀时孤儿会话无法补删（如实记录的取舍）。图片明确
+拒绝 400（上传入口要前端 a_bogus 签名）；签到纯只读、今天已领报 claimed。额度三池走
+滚动指针分档，倍率进 rate、不编价格。
+
 ### baizhi（百智云，**本机按需、不随包**）
 
 **Anthropic Messages 协议**渠道（`ai-models.app.baizhi.cloud/api/anthropic`，
@@ -253,6 +270,48 @@ magpie plugin on  "<目录>"
 ⚠️ 插件选项是**插件级**（所有实例共享同一个 options 对象）：
 `magpie plugin options hub-astudio '{"snapshotRefreshMinutes":10}'`
 （`snapshotRefreshMinutes` 控制页面快照的刷新周期，默认 5 分钟，0 = 关闭）
+
+## Headless / 远程登录（回调地址覆盖 + 粘贴中转）
+
+magpie 跑在**无头服务器**上、浏览器在你自己机器上时，OAuth 回调写死
+`127.0.0.1` 永远到不了服务器（[#3](https://github.com/Gyl1219/magpie-providers-hub/issues/3)）。
+两个插件选项解决它，**不填则桌面行为一格不变**：
+
+```bash
+magpie plugin options hub-lobsterai '{"oauthCallbackHost":"100.64.0.1","oauthCallbackPort":8765}'
+```
+
+- `oauthCallbackHost`：本机**对外可达**的 host（tailscale IP、局域网 IP 或域名）。
+  只填 host 本身，不带协议/端口/路径；IPv6 带方括号（`[fd7a:…::1]`）。
+- `oauthCallbackPort`：固定端口（1–65535，不能是 fetch 禁用端口如 6000/6666）；
+  不填 = 随机空闲端口（随机抽中禁用端口会自动重抽）。
+
+覆盖后回调服务绑 `0.0.0.0`、`redirect_uri` 用你填的 host，浏览器在别的机器也能
+把回调投进来。各渠道的具体形态：
+
+- **lobsterai / accio（OAuth 渠道）**：登录入口换成**中转页** `http://<host>:<port>/relay`
+  —— 页面上有厂商登录链接和一个粘贴框。在你自己的浏览器里完成登录后：
+  回调能直达服务器时**自动完成**（无需粘贴）；回调落在你自己机器上（页面显示
+  「无法访问」）时，把地址栏里的**完整回调地址**复制粘贴回中转页即可，code 交换
+  在服务器侧完成。贴错（state 不符/不是本次的 URL）只报错、**不终结会话**，可以重贴。
+- **marvis（QQ / 微信）**：厂商把 `redirect_uri` 锁死在 `yybadaccess.3g.qq.com`，
+  改不了 —— 所以另有两条登录入口「QQ 登录（粘贴回调地址）」「微信登录（粘贴回调地址）」：
+  在自己的浏览器打开授权页完成登录，浏览器停在 `yybadaccess…marvis_oauth?code=…&state=…`
+  （打不开是正常的），把整条地址粘贴进 magpie 弹出的输入框。state 必须与本次登录
+  一致，一条回调地址只能换取一次。
+- **载体页渠道（astudio / loomy / magicrew / monkeycode / baizhi）**：登录页地址
+  跟着覆盖 host 走，在你自己的浏览器里打开 `http://<host>:<port>/login` 照常登录
+  （页内请求全是相对路径）。浏览器自动路（CDP 拉本机 Chromium）仍在服务器本机跑，
+  无头环境走页内的短信/密码/粘贴路。
+
+⚠️ 安全口径：覆盖后登录页/回调口对**绑定网卡可达**。OAuth 渠道仍有 state/PKCE
+原样回验兜底（伪造投递进不来）；载体页渠道请只在可信网络（如 tailscale）里启用。
+桌面默认模式只绑回环，一个字节都不变。
+
+> **宿主自带粘贴兜底**（2026-11-17 真机实测）：magpie 登录对话框对 auto 入口也有
+> 「若浏览器最终停在打不开的页面…粘贴完整地址」的输入框，宿主会**代發粘贴地址**
+> 把回调投进插件的 loopback 再收结果。桌面默认模式直接可用；覆盖模式下粘贴地址
+> 的 host 须对 magpie 机器可达（即你填的覆盖 host）。它与上面的中转页互为兜底。
 
 ## 为什么做这些
 

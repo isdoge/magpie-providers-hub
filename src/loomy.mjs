@@ -38,6 +38,7 @@
 
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
+import { oauthRedirect, listenCallbackPort } from './shared.mjs'
 
 export const CHANNEL_ID = 'loomy'
 export const DISPLAY_NAME = 'Loomy (讯飞)'
@@ -780,7 +781,10 @@ document.getElementById('bgo').onclick = async () => {
  *     bind===0 → 回 need_phone，页面显示绑定表单；
  *   POST /wechat/complete → send_sms / verify_sms 完成绑定登录。
  */
-async function beginLogin(openBrowser) {
+async function beginLogin(openBrowser, opts = {}) {
+  // 载体页地址收口（issue #3）：默认 127.0.0.1；options 覆盖后绑 0.0.0.0，
+  // 远程浏览器经对外可达 host 扫码/短信登录（页面内请求全是相对路径）。
+  const redirect = oauthRedirect(opts.options)
   const LOGIN_WINDOW_MS = 10 * 60 * 1000
   let settleOk, settleFail
   const result = new Promise((resolve, reject) => { settleOk = resolve; settleFail = reject })
@@ -885,23 +889,9 @@ async function beginLogin(openBrowser) {
     }
   })
 
-  const port = await new Promise((resolve, reject) => {
-    let settled = false
-    server.once('error', (error) => {
-      if (settled) return
-      settled = true
-      reject(error)
-    })
-    server.listen(0, '127.0.0.1', () => {
-      settled = true
-      server.on('error', () => {})
-      // ⚠️ unref：登录窗口是独立的用户流程，不该吊住宿主进程的退出
-      //   （测试里未结算 result 的用例否则会挂满 10 分钟超时）。
-      server.unref()
-      const addr = server.address()
-      resolve(typeof addr === 'object' && addr !== null ? addr.port : 0)
-    })
-  }).catch((error) => {
+  // ⚠️ unref：登录窗口是独立的用户流程，不该吊住宿主进程的退出
+  //   （测试里未结算 result 的用例否则会挂满 10 分钟超时）。
+  const port = await listenCallbackPort(server, redirect, { unref: true }).catch((error) => {
     settle(false, new Error(`Loomy 回调端口无法监听（${error.message}）`))
     throw error
   })
@@ -909,9 +899,12 @@ async function beginLogin(openBrowser) {
   // uuid 在起服务前取好（失败则整个流程起不来）
   state.uuid = await fetchLoomyWechatUuid(randomUUID())
 
-  const url = `http://127.0.0.1:${port}/login`
+  const url = `http://${redirect.urlHost}:${port}/login`
   if (openBrowser) openBrowser(url)
-  return { url, result, instructions: `在打开的页面里完成登录（微信扫码或短信），完成后本窗口自动继续。也可以手动打开：${url}` }
+  const remoteNote = redirect.overridden
+    ? `（登录页地址已覆盖为 ${redirect.urlHost}:${port} —— 请在你自己的浏览器里打开）`
+    : ''
+  return { url, result, instructions: `${remoteNote}在打开的页面里完成登录（微信扫码或短信），完成后本窗口自动继续。` }
 }
 
 /** 微信登录结果 → 渠道凭据（session 14 天）。 */
