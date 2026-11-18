@@ -39,7 +39,7 @@
 
 import { createServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
-import { assignExpiryBands, debugLog, notSignedIn, oauthRedirect, listenCallbackPort } from './shared.mjs'
+import { assignExpiryBands, debugLog, notSignedIn, oauthRedirect, listenCallbackPort, headlessCarrierNote } from './shared.mjs'
 
 const PROVIDER = 'astudio'
 const DISPLAY = 'AStudio（讯飞）'
@@ -815,7 +815,11 @@ export const astudioChannel = {
   async beginLogin(openBrowser, opts = {}) {
     const flow = await startLoginFlow(opts.options)
     if (openBrowser) openBrowser(flow.loginUrl)
-    return { url: flow.loginUrl, result: flow.result }
+    return {
+      url: flow.loginUrl,
+      result: flow.result,
+      instructions: `在打开的页面里完成登录（极验 + 短信/密码/微信），完成后本窗口自动继续。${headlessCarrierNote(oauthRedirect(opts.options))}`,
+    }
   },
 
   /**

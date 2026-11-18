@@ -19,6 +19,7 @@ const {
   parsePastedCallbackUrl,
   isFetchBadPort,
   listenCallbackPort,
+  headlessCarrierNote,
 } = await import('../src/shared.mjs')
 const { lobsteraiChannel } = await import('../src/lobsterai.mjs')
 const { accioChannel } = await import('../src/accio.mjs')
@@ -424,4 +425,19 @@ test('loomy 覆盖：载体页入口换覆盖 host；短信登录路 settle', as
   } finally {
     stub.restore()
   }
+})
+// ── 无界面载体页提示（2026-11-18 真机报障配套）─────────────────────────
+
+test('headlessCarrierNote：Linux 无 DISPLAY 且未覆盖 → 提示配置覆盖；其余零噪音', () => {
+  const linuxHeadless = { DISPLAY: '', WAYLAND_DISPLAY: '' }
+  assert.match(headlessCarrierNote({ overridden: false }, linuxHeadless, 'linux'), /oauthCallbackHost/)
+  assert.match(headlessCarrierNote({ overridden: false }, linuxHeadless, 'linux'), /回环/)
+  // 已覆盖 → 不啰嗦
+  assert.equal(headlessCarrierNote({ overridden: true }, linuxHeadless, 'linux'), '')
+  // 有显示器的 Linux 桌面 → 不啰嗦
+  assert.equal(headlessCarrierNote({ overridden: false }, { DISPLAY: ':0' }, 'linux'), '')
+  // Windows 桌面 → 不啰嗦
+  assert.equal(headlessCarrierNote({ overridden: false }, {}, 'win32'), '')
+  // 显式声明（测试/其它平台）→ 提示
+  assert.match(headlessCarrierNote({ overridden: false }, { MAGPIE_HUB_HEADLESS: '1' }, 'win32'), /oauthCallbackHost/)
 })

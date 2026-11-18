@@ -29,7 +29,7 @@ const UA =
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { assignExpiryBands, debugLog, oauthRedirect, listenCallbackPort } from './shared.mjs'
+import { assignExpiryBands, debugLog, oauthRedirect, listenCallbackPort, headlessCarrierNote } from './shared.mjs'
 
 const REQUEST_TIMEOUT_MS = 30_000
 /** api_key 只活 2 小时，提前 10 分钟续。 */
@@ -710,7 +710,11 @@ $('go-jwt').addEventListener('click', async () => {
     const port = await listenCallbackPort(server, redirect)
     const url = `http://${redirect.urlHost}:${port}/login`
     try { openBrowser?.(url) } catch { /* ignore */ }
-    return { url, result }
+    return {
+      url,
+      result,
+      instructions: `在打开的页面里完成超级麦吉登录（浏览器登录 / 手机号密码 / 粘贴 JWT），完成后本窗口自动继续。${headlessCarrierNote(redirect)}`,
+    }
   }
 
   /** 若 api_key 快过期（或没签过），续期/签发。refresh_token 一次性，串行。 */

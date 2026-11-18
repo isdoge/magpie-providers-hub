@@ -140,6 +140,24 @@ const FETCH_BAD_PORTS = new Set([
 export const isFetchBadPort = (port) => FETCH_BAD_PORTS.has(Number(port))
 
 /**
+ * 无界面环境的载体页提示（2026-11-18 真机报障：Linux magpie 被桌面访问时，
+ * 点登录给 127.0.0.1 打不开，对话框却毫无解释）。仅在「疑似无界面 **且**
+ * 未配置覆盖」时出文案；桌面零噪音。判定：Linux 无 DISPLAY/WAYLAND_DISPLAY，
+ * 或 MAGPIE_HUB_HEADLESS=1 显式声明（测试/其它平台用）。
+ * ⚠️ 只提示、**不自动覆盖**：载体页没有 state/PKCE 兜底，默认暴露网卡是
+ *    安全回归（issue #3 定案口径：覆盖必须显式 opt-in，仅限可信网络）。
+ */
+export const headlessCarrierNote = (redirect, env = process.env, platform = process.platform) => {
+  if (redirect?.overridden) return ''
+  const headless = env.MAGPIE_HUB_HEADLESS === '1'
+    || (platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY)
+  if (!headless) return ''
+  return ' 注意：检测到无界面环境。此地址默认只绑服务器回环，你自己的浏览器打不开是正常的——'
+    + '设置插件选项 oauthCallbackHost（本机对外可达 IP）/ oauthCallbackPort 后重新登录，'
+    + '地址会换成可达 host（见 README「Headless / 远程登录」）；仅限可信网络启用。'
+}
+
+/**
  * 起回调/载体页服务的统一 listen 包装：
  *   · 先挂 error 再 listen（EADDRINUSE 是异步 error 事件，不挂会崩进程）；
  *   · 只等端口绑定（毫秒级），不等用户登录；

@@ -56,7 +56,7 @@
 
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { oauthRedirect, listenCallbackPort, expiryBandedWindows, fetchWithRetry, notSignedIn, isFetchBadPort } from './shared.mjs'
+import { oauthRedirect, listenCallbackPort, expiryBandedWindows, fetchWithRetry, notSignedIn, isFetchBadPort, headlessCarrierNote } from './shared.mjs'
 import { browserHooks } from './doubaowork-browser.mjs'
 import {
   ProviderError, upstreamError,
@@ -1110,7 +1110,7 @@ async function beginLogin(openBrowser, opts = {}) {
   return {
     url,
     result,
-    instructions: `${remoteNote}在打开的页面里粘贴 doubao.com 的 Cookie 完成登录，完成后本窗口自动继续。`,
+    instructions: `${remoteNote}在打开的页面里粘贴 doubao.com 的 Cookie 完成登录，完成后本窗口自动继续。${headlessCarrierNote(redirect)}`,
     // 取消入口（测试收尾 / 宿主主动关闭载体用）
     close: () => settle(false, new Error('豆包工作登录载体已关闭')),
   }

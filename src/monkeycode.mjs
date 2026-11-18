@@ -38,7 +38,7 @@
 
 import { createHash, createHmac } from 'node:crypto'
 import { createServer } from 'node:http'
-import { oauthRedirect, listenCallbackPort } from './shared.mjs'
+import { oauthRedirect, listenCallbackPort, headlessCarrierNote } from './shared.mjs'
 import {
   buildAnthropicPayload,
   anthropicSseToOpenAi,
@@ -957,7 +957,7 @@ async function beginLoginFor(site, openBrowser, options = {}) {
   return {
     url,
     result,
-    instructions: `已为你打开登录页与官方浏览器窗口：在官方页面完成登录即可自动换取凭据；也可以在登录页手动粘贴 API Key 与签名密钥。`,
+    instructions: `已为你打开登录页与官方浏览器窗口：在官方页面完成登录即可自动换取凭据；也可以在登录页手动粘贴 API Key 与签名密钥。${headlessCarrierNote(redirect)}`,
   }
 }
 

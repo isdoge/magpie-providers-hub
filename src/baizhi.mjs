@@ -44,7 +44,7 @@
 
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { oauthRedirect, listenCallbackPort } from './shared.mjs'
+import { oauthRedirect, listenCallbackPort, headlessCarrierNote } from './shared.mjs'
 import {
   launchLoginBrowser,
   closeSession,
@@ -833,7 +833,7 @@ async function beginLogin(openBrowser, opts = {}) {
   return {
     url,
     result,
-    instructions: `在打开的页面里登录 baizhi.cloud（微信扫码），登录后自动取 Key；也可以在页面下方直接粘贴。`,
+    instructions: `在打开的页面里登录 baizhi.cloud（微信扫码），登录后自动取 Key；也可以在页面下方直接粘贴。${headlessCarrierNote(redirect)}`,
   }
 }
 

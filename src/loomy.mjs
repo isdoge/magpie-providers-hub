@@ -38,7 +38,7 @@
 
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
-import { oauthRedirect, listenCallbackPort } from './shared.mjs'
+import { oauthRedirect, listenCallbackPort, headlessCarrierNote } from './shared.mjs'
 
 export const CHANNEL_ID = 'loomy'
 export const DISPLAY_NAME = 'Loomy (讯飞)'
@@ -904,7 +904,7 @@ async function beginLogin(openBrowser, opts = {}) {
   const remoteNote = redirect.overridden
     ? `（登录页地址已覆盖为 ${redirect.urlHost}:${port} —— 请在你自己的浏览器里打开）`
     : ''
-  return { url, result, instructions: `${remoteNote}在打开的页面里完成登录（微信扫码或短信），完成后本窗口自动继续。` }
+  return { url, result, instructions: `${remoteNote}在打开的页面里完成登录（微信扫码或短信），完成后本窗口自动继续。${headlessCarrierNote(redirect)}` }
 }
 
 /** 微信登录结果 → 渠道凭据（session 14 天）。 */
