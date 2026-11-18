@@ -483,3 +483,34 @@ test('headlessCarrierNote：auto 覆盖 → 公网安全口径提示；显式覆
   assert.match(headlessCarrierNote({ overridden: true, auto: true }, {}, 'win32'), /oauthCallbackHost/)
   assert.equal(headlessCarrierNote({ overridden: true }, {}, 'win32'), '')
 })
+
+// ── 容器环境（2026-11-18 真机：Docker 里自动挑了 172.18.0.2 外部打不开）────
+
+const { isContainerized } = await import('../src/shared.mjs')
+
+test('容器内跳过 docker 网段：只有 172.18 → 回环 + 容器指引；host 网络真实网卡照常自动', () => {
+  const env = { MAGPIE_HUB_HEADLESS: '1' }
+  const onlyBridge = { eth0: [{ family: 'IPv4', internal: false, address: '172.18.0.2' }] }
+  const r = oauthRedirect({}, { env, platform: 'win32', interfaces: onlyBridge, container: true })
+  assert.equal(r.overridden, false, '容器网桥地址不可自动使用')
+  assert.equal(r.host, '127.0.0.1')
+  assert.equal(r.containerDetected, true)
+  assert.match(headlessCarrierNote(r, env, 'win32'), /容器/)
+  assert.match(headlessCarrierNote(r, env, 'win32'), /oauthCallbackHost/)
+  // host 网络模式：真实网卡地址照常自动
+  const hostNet = { eth0: [{ family: 'IPv4', internal: false, address: '192.168.1.50' }] }
+  const ok = oauthRedirect({}, { env, platform: 'win32', interfaces: hostNet, container: true })
+  assert.equal(ok.auto, true)
+  assert.equal(ok.host, '192.168.1.50')
+})
+
+test('isContainerized：dockerenv / cgroup 标记识别；普通主机 false', () => {
+  const fakeFs = ({ dockerenv = false, cgroup = '' } = {}) => ({
+    existsSync: (p) => dockerenv && (p === '/.dockerenv' || p === '/run/.containerenv'),
+    readFileSync: () => cgroup,
+  })
+  assert.equal(isContainerized(fakeFs({ dockerenv: true })), true)
+  assert.equal(isContainerized(fakeFs({ cgroup: '0::/docker/abc' })), true)
+  assert.equal(isContainerized(fakeFs({ cgroup: '0::/system.slice/foo.service' })), false)
+  assert.equal(isContainerized({ existsSync: () => { throw new Error('x') }, readFileSync: () => { throw new Error('x') } }), false)
+})

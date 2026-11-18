@@ -3,7 +3,7 @@
 // ⚠️ v0.5.0 起本模块**不写任何文件**（除了显式开启的诊断日志，且落在系统临时目录）：
 //    插件不碰 magpie 的配置目录，账号只存 magpie 账号槽。
 
-import { readFileSync, appendFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, appendFileSync, mkdirSync, existsSync } from 'node:fs'
 import { homedir, tmpdir, networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 
@@ -147,13 +147,31 @@ export const isLikelyHeadless = (env = process.env, platform = process.platform)
   env.MAGPIE_HUB_HEADLESS === '1' || (platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY)
 
 /**
+ * 容器环境识别（Docker/Podman/K8s）：用于把「容器内网桥地址」从自动覆盖候选里剔除。
+ * 2026-11-18 真机：Docker 里 magpie 自动挑了容器 eth0 的 172.18.0.2，外部打不开。
+ */
+export const isContainerized = (fsLike = { existsSync, readFileSync }) => {
+  try { if (fsLike.existsSync('/.dockerenv') || fsLike.existsSync('/run/.containerenv')) return true } catch { /* ignore */ }
+  try {
+    const cgroup = fsLike.readFileSync('/proc/1/cgroup', 'utf8')
+    return /docker|kubepods|containerd|lxc/i.test(String(cgroup))
+  } catch { return false }
+}
+
+/** docker 默认桥接网段 172.16.0.0/12（容器内多半是它，外部不可达）。 */
+const isDockerBridgeIp = (address) => /^172\.(1[6-9]|2\d|3[01])\./.test(String(address))
+
+/**
  * 挑一个对外可达的 IPv4（无界面零配置用）。跳过回环与 docker/veth/网桥等
  * 虚拟网卡（它们对外不可达）；VPN 的 tun/tap 保留（往往正是可达地址）。
+ * 容器内（container=true）额外跳过 172.16/12 —— host 网络模式下真实网卡照常可用。
  * 首选真实网卡，全被跳过时退而求其次任取非内部 IPv4；都没有返回 ''。
  */
-export function pickExternalIPv4(interfaces = networkInterfaces()) {
+export function pickExternalIPv4(interfaces = networkInterfaces(), { container = false } = {}) {
   const entries = Object.entries(interfaces ?? {})
-  const ipv4 = (list) => (list ?? []).find((a) => (a.family === 'IPv4' || a.family === 4) && !a.internal)
+  const ok = (a) => (a.family === 'IPv4' || a.family === 4) && !a.internal
+    && (!container || !isDockerBridgeIp(a.address))
+  const ipv4 = (list) => (list ?? []).find(ok)
   const virtual = /^(lo|docker|veth|br-|virbr|vbox|vmnet)/i
   for (const [name, list] of entries) {
     if (virtual.test(name)) continue
@@ -170,6 +188,7 @@ export function pickExternalIPv4(interfaces = networkInterfaces()) {
 /**
  * 无界面环境的载体页提示（2026-11-18 真机报障配套）。
  * - auto 覆盖生效 → 安全口径提示（绑了全网卡，公网 IP 机器须知）；
+ * - 容器环境且未显式配置 → 容器指引（配 host+固定端口 + docker 发布端口）；
  * - 无界面但没挑到对外地址 → 提示显式配置 oauthCallbackHost；
  * - 桌面 / 显式覆盖 → 零噪音。
  * ⚠️ 自动覆盖只发生在无界面环境（用户定案）；桌面默认仍只绑回环。
@@ -181,6 +200,11 @@ export const headlessCarrierNote = (redirect, env = process.env, platform = proc
       + 'oauthCallbackHost（如内网 IP）后重新登录。'
   }
   if (redirect?.overridden) return ''
+  if (redirect?.containerDetected) {
+    return ' 注意：检测到容器环境（Docker/Podman），容器内网桥地址外部不可达，未自动覆盖。'
+      + '请设置插件选项 oauthCallbackHost（宿主对外可达 IP）/ oauthCallbackPort（固定端口），'
+      + '并在容器启动参数里发布该端口（如 -p 8765:8765），然后重新登录。'
+  }
   if (!isLikelyHeadless(env, platform)) return ''
   return ' 注意：检测到无界面环境且未挑到对外网卡地址。此地址只绑服务器回环，你自己的浏览器打不开是正常的——'
     + '设置插件选项 oauthCallbackHost（本机对外可达 IP）/ oauthCallbackPort 后重新登录，'
@@ -241,7 +265,7 @@ export async function listenCallbackPort(server, redirect, { unref = false, atte
  * ⚠️ 安全口径：覆盖后载体页/回调口对绑定网卡可达 —— OAuth 渠道仍有
  *    state/PKCE 回验兜底；载体页渠道请只在可信网络（如 tailscale）里启用。
  */
-export function oauthRedirect(options = {}, { env = process.env, platform = process.platform, interfaces } = {}) {
+export function oauthRedirect(options = {}, { env = process.env, platform = process.platform, interfaces, container } = {}) {
   const rawHost = options?.oauthCallbackHost
   const rawPort = options?.oauthCallbackPort
   const hasHost = typeof rawHost === 'string' && rawHost.trim() !== ''
@@ -249,12 +273,21 @@ export function oauthRedirect(options = {}, { env = process.env, platform = proc
   if (!hasHost && !hasPort) {
     // 无界面零配置（2026-11-18 用户定案：最通用，不假设 tailscale）：
     // 自动挑对外网卡地址、绑 0.0.0.0，载体页/中转页在自己浏览器直接可开。
+    // 容器内跳过网桥网段（容器 IP 外部不可达）；挑不到就回环 + 容器/无界面指引。
     // 桌面（非无界面）一个字节不变；显式选项永远优先（见下）。
+    const inContainer = container ?? isContainerized()
     if (isLikelyHeadless(env, platform)) {
-      const ip = pickExternalIPv4(interfaces ?? networkInterfaces())
+      const ip = pickExternalIPv4(interfaces ?? networkInterfaces(), { container: inContainer })
       if (ip) return { host: ip, urlHost: ip, port: 0, bindHost: '0.0.0.0', overridden: true, auto: true }
     }
-    return { host: OAUTH_CALLBACK_DEFAULT_HOST, urlHost: OAUTH_CALLBACK_DEFAULT_HOST, port: 0, bindHost: OAUTH_CALLBACK_DEFAULT_HOST, overridden: false }
+    return {
+      host: OAUTH_CALLBACK_DEFAULT_HOST,
+      urlHost: OAUTH_CALLBACK_DEFAULT_HOST,
+      port: 0,
+      bindHost: OAUTH_CALLBACK_DEFAULT_HOST,
+      overridden: false,
+      ...(inContainer ? { containerDetected: true } : {}),
+    }
   }
 
   let host = OAUTH_CALLBACK_DEFAULT_HOST
